@@ -49,14 +49,18 @@ class SecurityTaskResource extends Resource
                 ->multiple()
                 ->options(function (Get $get): array {
                     $agent = ClusterAgent::query()->find($get('cluster_agent_id'));
+                    $supportedTools = TaskExecutionService::getAvailableTools();
 
                     if (! $agent) {
-                        return TaskExecutionService::getAvailableTools();
+                        return $supportedTools;
                     }
 
-                    return collect($agent->available_tools)
-                        ->mapWithKeys(fn (string $tool): array => [$tool => TaskExecutionService::getAvailableTools()[$tool] ?? $tool])
+                    $agentTools = collect($agent->available_tools)
+                        ->filter(fn (string $tool): bool => array_key_exists($tool, $supportedTools))
+                        ->mapWithKeys(fn (string $tool): array => [$tool => $supportedTools[$tool]])
                         ->all();
+
+                    return $agentTools !== [] ? $agentTools : $supportedTools;
                 })
                 ->searchable()
                 ->preload()

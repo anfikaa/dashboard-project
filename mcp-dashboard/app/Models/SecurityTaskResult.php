@@ -11,6 +11,7 @@ class SecurityTaskResult extends Model
         'security_task_id',
         'task_identifier',
         'source_tool',
+        'cluster_name',
         'severity',
         'scan_finding',
         'recommendation',

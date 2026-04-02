@@ -2,61 +2,25 @@
 
 namespace App\Services;
 
-use App\Models\SecurityTaskResult;
-use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
 
 class DashboardResultService
 {
-    public function baseQuery(?array $filters = null): Builder
-    {
-        $filters ??= [];
-
-        return SecurityTaskResult::query()
-            ->with('task.clusterAgent')
-            ->when(
-                filled($filters['task_identifier'] ?? null),
-                fn (Builder $query): Builder => $query->where('task_identifier', $filters['task_identifier']),
-            )
-            ->when(
-                filled($filters['source_tool'] ?? null),
-                fn (Builder $query): Builder => $query->where('source_tool', $filters['source_tool']),
-            )
-            ->when(
-                filled($filters['cluster_name'] ?? null),
-                fn (Builder $query): Builder => $query->whereHas(
-                    'task.clusterAgent',
-                    fn (Builder $clusterQuery): Builder => $clusterQuery->where('cluster_name', $filters['cluster_name']),
-                ),
-            );
-    }
+    public function __construct(
+        protected ScanService $scanService,
+    ) {}
 
     public function summarize(?array $filters = null): array
     {
-        $summary = [
-            'PASS' => 0,
-            'FAIL' => 0,
-            'WARN' => 0,
-        ];
-
-        $this->baseQuery($filters)
-            ->get(['severity', 'metadata'])
-            ->each(function (SecurityTaskResult $result) use (&$summary): void {
-                $bucket = $this->bucketForResult($result);
-                $summary[$bucket]++;
-            });
-
-        return $summary;
+        return $this->scanService->summarize($this->getFilteredFindings($filters));
     }
 
     public function getTopFindings(?array $filters = null, ?string $search = null): Collection
     {
-        $records = $this->baseQuery($filters)
-            ->orderByDesc('scanned_at')
-            ->get()
-            ->map(fn (SecurityTaskResult $result): array => $this->transformResult($result))
-            ->filter(fn (array $finding): bool => in_array($finding['status'], ['FAIL', 'WARN'], true))
+        $records = $this->getFilteredFindings($filters)
+            ->filter(fn (array $finding): bool => in_array($finding['status_bucket'], ['FAIL', 'WARN'], true))
+            ->map(fn (array $finding): array => $this->transformFinding($finding))
             ->sortBy([
                 ['severity_rank', 'desc'],
                 ['scanned_at', 'desc'],
@@ -72,9 +36,12 @@ class DashboardResultService
         return $records
             ->filter(function (array $finding) use ($needle): bool {
                 $haystack = Str::lower(implode(' ', array_filter([
+                    $finding['scan_id'] ?? '',
                     $finding['task_identifier'] ?? '',
                     $finding['source_tool'] ?? '',
                     $finding['cluster_name'] ?? '',
+                    $finding['scan_status'] ?? '',
+                    $finding['scan_datetime'] ?? '',
                     $finding['control_id'] ?? '',
                     $finding['test_number'] ?? '',
                     $finding['section'] ?? '',
@@ -91,37 +58,71 @@ class DashboardResultService
             ->values();
     }
 
-    public function bucketForResult(SecurityTaskResult $result): string
+    public function getDashboardOptions(string $field): array
     {
-        $severity = Str::upper((string) $result->severity);
-        $status = Str::upper((string) ($result->metadata['status'] ?? ''));
-
-        return match (true) {
-            in_array($severity, ['FAIL', 'CRITICAL', 'HIGH'], true),
-            in_array($status, ['FAIL', 'FAILED'], true) => 'FAIL',
-            in_array($severity, ['WARN', 'MEDIUM'], true),
-            in_array($status, ['WARN', 'WARNING'], true) => 'WARN',
-            default => 'PASS',
-        };
+        return $this->allFindings()
+            ->pluck($field)
+            ->filter(fn ($value): bool => filled($value))
+            ->unique()
+            ->sort()
+            ->values()
+            ->mapWithKeys(fn (string $value): array => [$value => $value])
+            ->all();
     }
 
-    protected function transformResult(SecurityTaskResult $result): array
+    protected function getFilteredFindings(?array $filters = null): Collection
     {
-        $metadata = $result->metadata ?? [];
-        $bucket = $this->bucketForResult($result);
+        $filters ??= [];
+
+        return $this->allFindings()
+            ->when(
+                filled($filters['task_identifier'] ?? null),
+                fn (Collection $findings): Collection => $findings->where('scan_id', $filters['task_identifier'])->values(),
+            )
+            ->when(
+                filled($filters['source_tool'] ?? null),
+                fn (Collection $findings): Collection => $findings->where('tool', $filters['source_tool'])->values(),
+            )
+            ->when(
+                filled($filters['cluster_name'] ?? null),
+                fn (Collection $findings): Collection => $findings->where('cluster_name', $filters['cluster_name'])->values(),
+            );
+    }
+
+    protected function allFindings(): Collection
+    {
+        return $this->scanService->getNormalizedFindingsForTools(array_keys(TaskExecutionService::getAvailableTools()));
+    }
+
+    protected function transformFinding(array $finding): array
+    {
+        $metadata = $finding['metadata'] ?? [];
+        $bucket = $finding['status_bucket'];
 
         return [
-            'key' => (string) $result->id,
-            'task_identifier' => $result->task_identifier,
-            'source_tool' => $result->source_tool,
-            'cluster_name' => $result->task?->clusterAgent?->cluster_name,
+            'key' => implode('-', array_filter([
+                $finding['scan_id'] ?? null,
+                $finding['tool'] ?? null,
+                $finding['cluster_name'] ?? null,
+                $metadata['sample_file'] ?? null,
+                $metadata['control_id'] ?? null,
+                $metadata['test_number'] ?? null,
+                $metadata['rule_uuid'] ?? null,
+                md5(($finding['description'] ?? '') . ($finding['object'] ?? '')),
+            ])),
+            'scan_id' => $finding['scan_id'] ?? ($metadata['scan_id'] ?? 'sample-scan'),
+            'task_identifier' => $finding['scan_id'] ?? ($metadata['scan_id'] ?? 'sample-scan'),
+            'source_tool' => $finding['tool'],
+            'cluster_name' => $finding['cluster_name'],
+            'scan_status' => $finding['scan_status'] ?? ($metadata['scan_status'] ?? 'UNKNOWN'),
+            'scan_datetime' => $finding['scanned_at']?->format('d M Y H:i:s'),
             'control_id' => $metadata['control_id'] ?? null,
             'test_number' => $metadata['test_number'] ?? null,
             'section' => $metadata['section'] ?? null,
-            'scan_finding' => $result->scan_finding,
-            'recommendation' => $result->recommendation,
-            'suggestion' => $result->suggestion,
-            'severity' => $result->severity,
+            'scan_finding' => $finding['description'],
+            'recommendation' => $finding['recommendation'],
+            'suggestion' => $finding['suggestion'],
+            'severity' => $bucket,
             'status' => $bucket,
             'severity_rank' => match ($bucket) {
                 'FAIL' => 3,
@@ -131,7 +132,7 @@ class DashboardResultService
             'actual' => $metadata['actual'] ?? null,
             'expected' => $metadata['expected'] ?? null,
             'object_label' => $this->resolveObjectLabel($metadata),
-            'scanned_at' => optional($result->scanned_at)?->timestamp ?? 0,
+            'scanned_at' => $finding['scanned_at']?->timestamp ?? 0,
         ];
     }
 
@@ -148,6 +149,8 @@ class DashboardResultService
         return collect([
             filled($metadata['control_id'] ?? null) ? 'Control ' . $metadata['control_id'] : null,
             filled($metadata['test_number'] ?? null) ? 'Test ' . $metadata['test_number'] : null,
+            filled($metadata['rule_name'] ?? null) ? 'Rule ' . $metadata['rule_name'] : null,
+            filled($metadata['file_path'] ?? null) ? 'File ' . $metadata['file_path'] : null,
         ])->filter()->join(' | ') ?: 'Finding context';
     }
 }

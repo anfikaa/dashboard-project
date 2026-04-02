@@ -10,7 +10,10 @@ class ThreatScore extends StatsOverviewWidget
 {
     use InteractsWithPageFilters;
 
-    protected int | string | array $columnSpan = 'full';
+    protected int | string | array $columnSpan = [
+        'default' => 1,
+        'md' => 1,
+    ];
 
     protected int | array | null $columns = 1;
 

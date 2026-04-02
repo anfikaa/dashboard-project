@@ -3,7 +3,6 @@
 namespace App\Filament\Resources;
 
 use App\Filament\Resources\SecurityTaskResultResource\Pages;
-use App\Models\SecurityTask;
 use App\Models\SecurityTaskResult;
 use Filament\Actions\Action;
 use Filament\Forms\Components\DatePicker;
@@ -55,6 +54,11 @@ class SecurityTaskResultResource extends Resource
                     ->label('Tool')
                     ->badge()
                     ->color('primary'),
+                Tables\Columns\TextColumn::make('cluster_name')
+                    ->label('Cluster')
+                    ->badge()
+                    ->color('gray')
+                    ->toggleable(),
                 Tables\Columns\TextColumn::make('severity')
                     ->badge()
                     ->color(fn (string $state): string => match ($state) {
@@ -85,9 +89,27 @@ class SecurityTaskResultResource extends Resource
             ->filters([
                 Tables\Filters\SelectFilter::make('task_identifier')
                     ->label('Task ID')
-                    ->options(fn (): array => SecurityTask::query()
-                        ->orderByDesc('created_at')
-                        ->pluck('task_id', 'task_id')
+                    ->options(fn (): array => SecurityTaskResult::query()
+                        ->whereNotNull('task_identifier')
+                        ->distinct()
+                        ->orderByDesc('task_identifier')
+                        ->pluck('task_identifier', 'task_identifier')
+                        ->all()),
+                Tables\Filters\SelectFilter::make('source_tool')
+                    ->label('Tool')
+                    ->options(fn (): array => SecurityTaskResult::query()
+                        ->whereNotNull('source_tool')
+                        ->distinct()
+                        ->orderBy('source_tool')
+                        ->pluck('source_tool', 'source_tool')
+                        ->all()),
+                Tables\Filters\SelectFilter::make('cluster_name')
+                    ->label('Cluster')
+                    ->options(fn (): array => SecurityTaskResult::query()
+                        ->whereNotNull('cluster_name')
+                        ->distinct()
+                        ->orderBy('cluster_name')
+                        ->pluck('cluster_name', 'cluster_name')
                         ->all()),
                 Tables\Filters\Filter::make('scanned_at')
                     ->label('Scanned Time')
@@ -190,11 +212,15 @@ class SecurityTaskResultResource extends Resource
         $rows = [
             'Task ID' => $record->task_identifier,
             'Tool' => $record->source_tool,
+            'Cluster' => $record->cluster_name,
             'Severity' => $record->severity,
             'Scanned At' => optional($record->scanned_at)->format('d M Y H:i:s'),
+            'Finding Object' => static::resolvePrimaryObject($metadata),
             'Control ID' => $metadata['control_id'] ?? null,
             'Test Number' => $metadata['test_number'] ?? null,
             'Section' => $metadata['section'] ?? null,
+            'Rule Name' => $metadata['rule_name'] ?? null,
+            'File Path' => $metadata['file_path'] ?? null,
             'Actual Value' => $metadata['actual'] ?? null,
             'Expected Value' => $metadata['expected'] ?? null,
         ];
@@ -271,6 +297,19 @@ class SecurityTaskResultResource extends Resource
                 'badge' => 'bg-gray-50 text-gray-700 ring-gray-200 dark:bg-gray-500/10 dark:text-gray-200 dark:ring-gray-500/30',
             ],
         };
+    }
+
+    protected static function resolvePrimaryObject(array $metadata): ?string
+    {
+        foreach (['object', 'resource', 'resource_name', 'object_name', 'name'] as $key) {
+            $value = $metadata[$key] ?? null;
+
+            if (is_string($value) && filled($value)) {
+                return $value;
+            }
+        }
+
+        return null;
     }
 
     protected static function renderChip(string $label, mixed $value, string $tone): ?string

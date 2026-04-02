@@ -2,9 +2,7 @@
 
 namespace App\Filament\Pages;
 
-use App\Models\ClusterAgent;
-use App\Models\SecurityTask;
-use App\Models\SecurityTaskResult;
+use App\Services\DashboardResultService;
 use Filament\Forms\Components\Select;
 use Filament\Pages\Dashboard as BaseDashboard;
 use Filament\Pages\Dashboard\Concerns\HasFiltersForm;
@@ -25,7 +23,7 @@ class Dashboard extends BaseDashboard
 
     public function getSubheading(): string | Htmlable | null
     {
-        return 'Overview of security findings from stored task results. Use filters to slice by scan, tool, or cluster.';
+        return 'Overview of security findings parsed directly from the sample JSON files in storage/app/scan.';
     }
 
     protected function getHeaderWidgets(): array
@@ -37,7 +35,6 @@ class Dashboard extends BaseDashboard
     {
         return [
             \App\Filament\Widgets\ScanOverview::class,
-            \App\Filament\Widgets\Severity::class,
             \App\Filament\Widgets\ThreatScore::class,
             \App\Filament\Widgets\TopFindings::class,
         ];
@@ -55,33 +52,20 @@ class Dashboard extends BaseDashboard
     {
         return $schema->components([
             Select::make('task_identifier')
-                ->label('Scan / Task ID')
-                ->options(fn (): array => SecurityTask::query()
-                    ->orderByDesc('created_at')
-                    ->pluck('task_id', 'task_id')
-                    ->all())
+                ->label('Scan ID')
+                ->options(fn (): array => app(DashboardResultService::class)->getDashboardOptions('scan_id'))
                 ->searchable()
                 ->preload()
                 ->placeholder('All scans'),
             Select::make('source_tool')
                 ->label('Tool')
-                ->options(fn (): array => SecurityTaskResult::query()
-                    ->whereNotNull('source_tool')
-                    ->distinct()
-                    ->orderBy('source_tool')
-                    ->pluck('source_tool', 'source_tool')
-                    ->all())
+                ->options(fn (): array => app(DashboardResultService::class)->getDashboardOptions('tool'))
                 ->searchable()
                 ->preload()
                 ->placeholder('All tools'),
             Select::make('cluster_name')
                 ->label('Cluster')
-                ->options(fn (): array => ClusterAgent::query()
-                    ->whereNotNull('cluster_name')
-                    ->distinct()
-                    ->orderBy('cluster_name')
-                    ->pluck('cluster_name', 'cluster_name')
-                    ->all())
+                ->options(fn (): array => app(DashboardResultService::class)->getDashboardOptions('cluster_name'))
                 ->searchable()
                 ->preload()
                 ->placeholder('All clusters'),

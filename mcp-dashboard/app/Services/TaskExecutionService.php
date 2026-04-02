@@ -13,12 +13,11 @@ class TaskExecutionService
     public static function getAvailableTools(): array
     {
         return [
+            'checkov' => 'Checkov',
             'kubebench' => 'Kube Bench',
             'kubescape' => 'Kubescape',
-            'rbac-tool' => 'RBAC Tool',
             'nmap' => 'Nmap',
-            'trivy' => 'Trivy',
-            'kube-hunter' => 'Kube Hunter',
+            'rbac-tool' => 'RBAC Tool',
         ];
     }
 
@@ -29,46 +28,46 @@ class TaskExecutionService
     public function run(SecurityTask $task): void
     {
         $task->results()->delete();
+        $selectedTools = collect($task->tools ?? [])
+            ->filter(fn (?string $tool): bool => array_key_exists((string) $tool, self::getAvailableTools()))
+            ->values()
+            ->all();
 
         $task->update([
             'status' => SecurityTaskStatus::Running,
-            'progress' => 15,
+            'progress' => 10,
             'started_at' => now(),
             'completed_at' => null,
-            'last_message' => 'Loading security scan data from source JSON.',
+            'last_message' => 'Loading sample scan files for the selected security tools.',
         ]);
 
         try {
-            $scanData = $this->scanService->getScanData();
-            $findings = collect($this->scanService->extractFindings($scanData));
+            $findings = $this->scanService->getNormalizedFindingsForTools($selectedTools);
 
             $task->update([
                 'progress' => 55,
-                'last_message' => 'Normalizing findings and building task result rows.',
+                'last_message' => 'Normalizing sample findings from each selected tool and building task result rows.',
             ]);
 
-            $results = $findings
-                ->filter(fn (array $finding): bool => in_array($finding['status'] ?? null, ['FAIL', 'WARN'], true))
-                ->values();
-
-            $scannedAt = Carbon::now();
-            $sourceTool = $task->tools[0] ?? 'multi-tool';
-
-            foreach ($results as $finding) {
+            foreach ($findings as $finding) {
                 SecurityTaskResult::create([
                     'security_task_id' => $task->id,
                     'task_identifier' => $task->task_id,
-                    'source_tool' => $sourceTool,
-                    'severity' => $finding['status'],
+                    'source_tool' => $finding['tool'],
+                    'cluster_name' => $finding['cluster_name'] ?? null,
+                    'severity' => $finding['status_bucket'],
                     'scan_finding' => $this->formatFinding($finding),
-                    'recommendation' => $finding['remediation'] ?? 'Review the reported issue and apply the recommended hardening control.',
+                    'recommendation' => $finding['recommendation'] ?? 'Review the reported issue and apply the recommended hardening control.',
                     'suggestion' => $this->makeSuggestion($finding),
-                    'metadata' => $finding,
-                    'scanned_at' => $scannedAt,
+                    'metadata' => $finding['metadata'] ?? [],
+                    'scanned_at' => $finding['scanned_at'] ?? Carbon::now(),
                 ]);
             }
 
-            $summary = $this->scanService->summarize($findings->all());
+            $summary = $this->scanService->summarize($findings);
+            $actionableCount = $findings
+                ->filter(fn (array $finding): bool => in_array($finding['status_bucket'] ?? null, ['FAIL', 'WARN'], true))
+                ->count();
 
             $task->update([
                 'status' => SecurityTaskStatus::Completed,
@@ -76,9 +75,10 @@ class TaskExecutionService
                 'completed_at' => now(),
                 'summary' => $summary,
                 'last_message' => sprintf(
-                    'Completed with %d actionable findings from %d total checks.',
-                    $results->count(),
+                    'Completed with %d actionable findings from %d normalized checks across %d selected tool(s).',
+                    $actionableCount,
                     $findings->count(),
+                    count($selectedTools),
                 ),
             ]);
         } catch (Throwable $exception) {
@@ -96,7 +96,12 @@ class TaskExecutionService
     protected function formatFinding(array $finding): string
     {
         $findingText = $finding['description'] ?? 'Finding generated from scan result.';
-        $actual = trim((string) ($finding['actual'] ?? ''));
+        $object = trim((string) ($finding['object'] ?? ''));
+        $actual = trim((string) data_get($finding, 'metadata.actual', ''));
+
+        if (filled($object)) {
+            $findingText .= ' Affected object: ' . $object . '.';
+        }
 
         if (filled($actual)) {
             $findingText .= ' Actual value: ' . $actual;
@@ -107,10 +112,11 @@ class TaskExecutionService
 
     protected function makeSuggestion(array $finding): string
     {
-        return match ($finding['status'] ?? null) {
-            'FAIL' => 'Treat this as a priority issue, remediate the control, then rerun the task to validate the fix.',
-            'WARN' => 'Review the configuration with the platform owner and confirm whether the warning is acceptable or needs remediation.',
-            default => 'No additional action is required.',
-        };
+        return $finding['suggestion']
+            ?? match ($finding['status_bucket'] ?? null) {
+                'FAIL' => 'Treat this as a priority issue, remediate the control, then rerun the task to validate the fix.',
+                'WARN' => 'Review the configuration with the platform owner and confirm whether the warning is acceptable or needs remediation.',
+                default => 'No additional action is required.',
+            };
     }
 }
