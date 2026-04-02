@@ -1,32 +1,32 @@
 <?php
 namespace App\Filament\Widgets;
 
-use App\Services\ScanService;
+use App\Services\DashboardResultService;
 use Filament\Widgets\StatsOverviewWidget;
 use Filament\Widgets\StatsOverviewWidget\Stat;
+use Filament\Widgets\Concerns\InteractsWithPageFilters;
 
 class ThreatScore extends StatsOverviewWidget
 {
+    use InteractsWithPageFilters;
+
     protected int | string | array $columnSpan = 'full';
 
     protected int | array | null $columns = 1;
 
     protected function getStats(): array
     {
-        $service = new ScanService();
-        $data = $service->getScanData();
+        $totals = app(DashboardResultService::class)->summarize($this->pageFilters);
 
-        $totals = $data['Totals'];
-
-        $total = $totals['total_pass'] + $totals['total_fail'] + $totals['total_warn'];
+        $total = ($totals['PASS'] ?? 0) + ($totals['FAIL'] ?? 0) + ($totals['WARN'] ?? 0);
 
         $score = $total > 0
-            ? round(($totals['total_pass'] / $total) * 100, 2)
+            ? round((($totals['PASS'] ?? 0) / $total) * 100, 2)
             : 0;
 
         return [
             Stat::make('Security Score', $score . '%')
-                ->description('Cluster Security Level')
+                ->description('Filtered security posture score')
                 ->color($score > 80 ? 'success' : ($score > 50 ? 'warning' : 'danger')),
         ];
     }

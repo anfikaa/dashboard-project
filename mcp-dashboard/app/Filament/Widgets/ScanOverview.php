@@ -2,11 +2,14 @@
 
 namespace App\Filament\Widgets;
 
-use App\Services\ScanService;
+use App\Services\DashboardResultService;
 use Filament\Widgets\ChartWidget;
+use Filament\Widgets\Concerns\InteractsWithPageFilters;
 
 class ScanOverview extends ChartWidget
 {
+    use InteractsWithPageFilters;
+
     protected ?string $heading = 'Scan Summary';
 
     protected int | string | array $columnSpan = [
@@ -18,10 +21,9 @@ class ScanOverview extends ChartWidget
 
     protected function getData(): array
     {
-        $service = new ScanService();
-        $data = $service->getScanData();
+        $totals = app(DashboardResultService::class)->summarize($this->pageFilters);
 
-        $totals = $data['Totals'] ?? [
+        $totals = $totals ?: [
             'total_pass' => 0,
             'total_fail' => 0,
             'total_warn' => 0,
@@ -31,9 +33,9 @@ class ScanOverview extends ChartWidget
             'datasets' => [
                 [
                     'data' => [
-                        $totals['total_pass'],
-                        $totals['total_fail'],
-                        $totals['total_warn'],
+                        $totals['PASS'] ?? 0,
+                        $totals['FAIL'] ?? 0,
+                        $totals['WARN'] ?? 0,
                     ],
                     'backgroundColor' => [
                         '#22c55e', // green

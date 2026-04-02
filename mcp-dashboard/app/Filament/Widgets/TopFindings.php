@@ -2,16 +2,18 @@
 
 namespace App\Filament\Widgets;
 
-use App\Services\ScanService;
+use App\Services\DashboardResultService;
 use Filament\Tables\Table;
 use Filament\Widgets\TableWidget;
 use Filament\Tables;
-use Illuminate\Database\Eloquent\Model;
+use Filament\Widgets\Concerns\InteractsWithPageFilters;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
 
 class TopFindings extends TableWidget
 {
+    use InteractsWithPageFilters;
+
     protected int | string | array $columnSpan = 'full';
 
     public static ?string $heading = 'Top Findings';
@@ -22,30 +24,41 @@ class TopFindings extends TableWidget
             ->heading('Top Findings')
             ->description('Search across failed findings from your imported security tool results.')
             ->searchable()
-            ->searchPlaceholder('Search findings, control ID, section, remediation...')
+            ->searchPlaceholder('Search task, tool, cluster, finding, remediation...')
             ->paginated([10, 25, 50])
             ->defaultPaginationPageOption(10)
             ->striped()
             ->records(fn (?string $search): Collection => $this->getFilteredRecords($search))
             ->columns([
-                Tables\Columns\TextColumn::make('test_number')
-                    ->label('ID')
-                    ->sortable(),
+                Tables\Columns\TextColumn::make('task_identifier')
+                    ->label('Scan ID')
+                    ->searchable(),
 
-                Tables\Columns\TextColumn::make('control_id')
-                    ->label('Control')
+                Tables\Columns\TextColumn::make('source_tool')
+                    ->label('Tool')
                     ->badge()
-                    ->color('gray'),
+                    ->color('primary'),
 
-                Tables\Columns\TextColumn::make('section')
-                    ->label('Section')
+                Tables\Columns\TextColumn::make('cluster_name')
+                    ->label('Cluster')
+                    ->badge()
+                    ->color('gray')
                     ->toggleable(),
 
-                Tables\Columns\TextColumn::make('description')
-                    ->label('Description')
+                Tables\Columns\TextColumn::make('object_label')
+                    ->label('Finding Object')
+                    ->toggleable(),
+
+                Tables\Columns\TextColumn::make('scan_finding')
+                    ->label('Finding')
                     ->wrap()
                     ->grow()
                     ->extraAttributes(['class' => 'whitespace-normal']),
+
+                Tables\Columns\TextColumn::make('recommendation')
+                    ->label('Remediation')
+                    ->wrap()
+                    ->toggleable(),
 
                 Tables\Columns\TextColumn::make('status')
                     ->badge()
@@ -58,39 +71,9 @@ class TopFindings extends TableWidget
             ]);
     }
 
-    public function getTableRecordKey(Model | array $record): string
-    {
-        return $record['key'];
-    }
-
     protected function getFilteredRecords(?string $search = null): Collection
     {
-        $service = new ScanService();
-        $data = $service->getScanData();
-        $findings = collect($service->extractFindings($data))
-            ->where('status', 'FAIL')
-            ->values();
-
-        if (blank($search)) {
-            return $findings;
-        }
-
-        $needle = Str::lower(trim($search));
-
-        return $findings
-            ->filter(function (array $finding) use ($needle): bool {
-                $haystack = Str::lower(implode(' ', [
-                    $finding['test_number'] ?? '',
-                    $finding['control_id'] ?? '',
-                    $finding['section'] ?? '',
-                    $finding['description'] ?? '',
-                    $finding['remediation'] ?? '',
-                    $finding['expected'] ?? '',
-                    $finding['actual'] ?? '',
-                ]));
-
-                return Str::contains($haystack, $needle);
-            })
-            ->values();
+        return app(DashboardResultService::class)->getTopFindings($this->pageFilters, $search)
+            ->mapWithKeys(fn (array $record): array => [$record['key'] => $record]);
     }
 }
