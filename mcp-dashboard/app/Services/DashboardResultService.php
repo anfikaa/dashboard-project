@@ -2,11 +2,15 @@
 
 namespace App\Services;
 
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
 
 class DashboardResultService
 {
+    protected const CACHE_VERSION = '2026-04-07-findings-scalar-v1';
+
     public function __construct(
         protected ScanService $scanService,
     ) {}
@@ -91,7 +95,34 @@ class DashboardResultService
 
     protected function allFindings(): Collection
     {
-        return $this->scanService->getNormalizedFindingsForTools(array_keys(TaskExecutionService::getAvailableTools()));
+        $tools = array_keys(TaskExecutionService::getAvailableTools());
+        $ttl = max(1, (int) env('SCAN_CACHE_TTL_SECONDS', 300));
+        $cacheKey = 'dashboard.scan-findings.' . md5(json_encode([
+            'version' => self::CACHE_VERSION,
+            'source' => env('SCAN_SOURCE', 'local'),
+            'disk' => env('SCAN_S3_DISK', 's3'),
+            'prefix' => env('SCAN_S3_PREFIX', 'result'),
+            'tools' => $tools,
+            'max_files' => env('SCAN_S3_MAX_FILES', 200),
+        ]));
+        $cached = Cache::get($cacheKey);
+
+        if (is_array($cached) && $cached !== []) {
+            return collect($cached)->map(fn (array $finding): array => $this->hydrateFinding($finding))->values();
+        }
+
+        $fresh = $this->scanService->getNormalizedFindingsForTools($tools)->values();
+        $serialized = $fresh
+            ->map(fn (array $finding): array => $this->serializeFinding($finding))
+            ->values();
+
+        if ($fresh->isNotEmpty()) {
+            Cache::put($cacheKey, $serialized->all(), now()->addSeconds($ttl));
+        } elseif (! is_array($cached)) {
+            Cache::put($cacheKey, [], now()->addSeconds(min($ttl, 60)));
+        }
+
+        return $serialized->map(fn (array $finding): array => $this->hydrateFinding($finding))->values();
     }
 
     protected function transformFinding(array $finding): array
@@ -152,5 +183,32 @@ class DashboardResultService
             filled($metadata['rule_name'] ?? null) ? 'Rule ' . $metadata['rule_name'] : null,
             filled($metadata['file_path'] ?? null) ? 'File ' . $metadata['file_path'] : null,
         ])->filter()->join(' | ') ?: 'Finding context';
+    }
+
+    protected function serializeFinding(array $finding): array
+    {
+        $finding['scanned_at'] = $this->normalizeScannedAt($finding['scanned_at'] ?? null)?->toIso8601String();
+
+        return $finding;
+    }
+
+    protected function hydrateFinding(array $finding): array
+    {
+        $finding['scanned_at'] = $this->normalizeScannedAt($finding['scanned_at'] ?? null);
+
+        return $finding;
+    }
+
+    protected function normalizeScannedAt(mixed $value): ?Carbon
+    {
+        if ($value instanceof Carbon) {
+            return $value;
+        }
+
+        if (is_string($value) && filled($value)) {
+            return Carbon::parse($value);
+        }
+
+        return null;
     }
 }

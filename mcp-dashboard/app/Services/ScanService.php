@@ -2,9 +2,13 @@
 
 namespace App\Services;
 
+use Aws\S3\S3Client;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use RuntimeException;
 
@@ -12,45 +16,57 @@ class ScanService
 {
     public function getAvailableSampleFiles(?array $tools = null): Collection
     {
-        $directory = storage_path('app/scan');
-        $requestedTools = collect($tools ?? [])->filter()->values();
+        $requestedTools = collect($tools)->filter()->values()->all();
+        $files = match ($this->getScanSource()) {
+            's3' => $this->getS3SampleFiles($requestedTools),
+            default => $this->getLocalSampleFiles(),
+        };
 
-        if (! File::isDirectory($directory)) {
-            throw new RuntimeException('Scan sample directory was not found.');
-        }
-
-        return collect(File::files($directory))
-            ->filter(fn ($file): bool => Str::endsWith($file->getFilename(), '.json'))
-            ->map(function ($file): array {
-                $tool = $this->detectToolFromFilename($file->getFilename());
-
-                return [
-                    'tool' => $tool,
-                    'path' => $file->getPathname(),
-                    'filename' => $file->getFilename(),
-                ];
-            })
-            ->filter(fn (array $file): bool => filled($file['tool']))
-            ->when(
-                $requestedTools->isNotEmpty(),
-                fn (Collection $files): Collection => $files->filter(
-                    fn (array $file): bool => $requestedTools->contains($file['tool'])
-                ),
-            )
+        return $files
             ->sortBy(['tool', 'filename'])
             ->values();
     }
 
     public function getNormalizedFindingsForTools(array $tools): Collection
     {
+        $requestedTools = collect($tools)->filter()->values();
         $files = $this->getAvailableSampleFiles($tools);
 
         if ($files->isEmpty()) {
             throw new RuntimeException('No matching scan sample files were found for the selected tools.');
         }
 
-        return $files
-            ->flatMap(fn (array $file): Collection => $this->parseSampleFile($file['path'], $file['tool']))
+        $findings = $files
+            ->flatMap(function (array $file): Collection {
+                try {
+                    return $this->parseSampleFile($file);
+                } catch (RuntimeException $exception) {
+                    if (
+                        Str::contains($exception->getMessage(), 'Unable to detect tool type for scan sample') ||
+                        Str::contains($exception->getMessage(), 'Scan sample file is not valid JSON') ||
+                        Str::contains($exception->getMessage(), 'Scan sample file is empty')
+                    ) {
+                        Log::warning('Skipping scan sample during dashboard ingestion.', [
+                            'path' => $file['path'] ?? null,
+                            'filename' => $file['filename'] ?? null,
+                            'source' => $file['source'] ?? null,
+                            'reason' => $exception->getMessage(),
+                        ]);
+
+                        return collect();
+                    }
+
+                    throw $exception;
+                }
+            })
+            ->values();
+
+        if ($requestedTools->isEmpty()) {
+            return $findings;
+        }
+
+        return $findings
+            ->filter(fn (array $finding): bool => $requestedTools->contains($finding['tool'] ?? null))
             ->values();
     }
 
@@ -73,35 +89,41 @@ class ScanService
         return $summary;
     }
 
-    protected function parseSampleFile(string $path, ?string $tool = null): Collection
+    protected function parseSampleFile(array $file): Collection
     {
-        if (! File::exists($path)) {
-            throw new RuntimeException("Scan sample file does not exist: {$path}");
+        $contents = $this->readSampleFileContents($file);
+
+        if (trim($contents) === '') {
+            throw new RuntimeException("Scan sample file is empty: {$file['path']}");
         }
 
-        $payload = json_decode(File::get($path), true);
+        $payload = $this->decodeSamplePayload($contents);
 
         if (! is_array($payload)) {
-            throw new RuntimeException("Scan sample file is not valid JSON: {$path}");
+            throw new RuntimeException("Scan sample file is not valid JSON: {$file['path']}");
         }
 
-        $tool ??= $this->detectToolFromFilename(basename($path)) ?? $this->detectToolFromPayload($payload);
+        $payload = $this->normalizePayload($payload);
+
+        $tool = $file['tool'] ?? $this->detectToolFromFilename($file['filename']) ?? $this->detectToolFromPayload($payload);
 
         if (blank($tool)) {
-            throw new RuntimeException("Unable to detect tool type for scan sample: {$path}");
+            throw new RuntimeException("Unable to detect tool type for scan sample: {$file['path']}");
         }
 
         $context = [
             'tool' => $tool,
-            'filename' => basename($path),
-            'scan_id' => $this->resolveScanId($payload, basename($path)),
+            'filename' => $file['filename'],
+            'path' => $file['path'],
+            'source' => $file['source'] ?? 'local',
+            'scan_id' => $this->resolveScanId($payload, $file['filename']),
             'scan_status' => $this->resolveScanStatus($payload),
             'cluster_name' => $payload['cluster_name'] ?? ($payload['stdout']['clusterName'] ?? 'Unknown cluster'),
             'scanned_at' => $this->resolveScannedAt($payload),
             'payload' => $payload,
         ];
 
-        return match ($tool) {
+        $findings = match ($tool) {
             'kubebench' => $this->parseKubebench($context),
             'kubescape' => $this->parseKubescape($context),
             'checkov' => $this->parseCheckov($context),
@@ -109,11 +131,704 @@ class ScanService
             'rbac-tool' => $this->parseRbacTool($context),
             default => throw new RuntimeException("Tool '{$tool}' is not supported by the sample parser."),
         };
+
+        $logContext = [
+            'tool' => $tool,
+            'path' => $context['path'],
+            'source' => $context['source'],
+            'scan_id' => $context['scan_id'],
+            'cluster_name' => $context['cluster_name'],
+            'findings_count' => $findings->count(),
+        ];
+
+        if ($findings->isEmpty()) {
+            Log::warning('Scan sample produced zero findings during dashboard ingestion.', $logContext + [
+                'top_level_keys' => array_keys($payload),
+                'stdout_keys' => array_keys(is_array($payload['stdout'] ?? null) ? $payload['stdout'] : []),
+                'stdout_type' => gettype($payload['stdout'] ?? null),
+                'stdout_length' => is_string($payload['stdout'] ?? null) ? strlen($payload['stdout']) : null,
+                'stdout_preview' => is_string($payload['stdout'] ?? null)
+                    ? Str::limit(preg_replace('/\s+/', ' ', $payload['stdout']), 240)
+                    : null,
+            ]);
+        } else {
+            Log::info('Scan sample parsed successfully for dashboard ingestion.', $logContext);
+        }
+
+        return $findings;
+    }
+
+    protected function getLocalSampleFiles(): Collection
+    {
+        $directory = storage_path(env('SCAN_LOCAL_PATH', 'app/scan'));
+
+        if (! File::isDirectory($directory)) {
+            throw new RuntimeException("Local scan sample directory was not found: {$directory}");
+        }
+
+        return collect(File::files($directory))
+            ->filter(fn ($file): bool => Str::endsWith($file->getFilename(), '.json'))
+            ->map(function ($file): array {
+                $filename = $file->getFilename();
+
+                return [
+                    'source' => 'local',
+                    'tool' => $this->detectToolFromFilename($filename),
+                    'path' => $file->getPathname(),
+                    'filename' => $filename,
+                ];
+            })
+            ->values();
+    }
+
+    protected function getS3SampleFiles(array $requestedTools = []): Collection
+    {
+        $disk = $this->getS3Disk();
+        $prefix = trim((string) env('SCAN_S3_PREFIX', 'result'), '/');
+        $maxFiles = max(1, (int) env('SCAN_S3_MAX_FILES', 200));
+        $perToolLimit = max(1, (int) env('SCAN_S3_MAX_FILES_PER_TOOL', 1));
+        $cacheTtl = max(1, (int) env('SCAN_S3_INDEX_CACHE_TTL_SECONDS', 300));
+        $cacheKey = 'scan-service.s3-index.' . md5(json_encode([
+            'version' => '2026-04-06-s3-list-v2',
+            'disk' => $disk,
+            'prefix' => $prefix,
+            'max_files' => $maxFiles,
+            'per_tool_limit' => $perToolLimit,
+            'requested_tools' => $requestedTools,
+        ]));
+        $paths = Cache::remember(
+            $cacheKey,
+            now()->addSeconds($cacheTtl),
+            fn (): array => $this->listS3SamplePaths($disk, $prefix, $maxFiles, $perToolLimit, $requestedTools),
+        );
+
+        return collect($paths)
+            ->map(function (string $path) use ($disk): array {
+                $filename = basename($path);
+
+                return [
+                    'source' => 's3',
+                    'disk' => $disk,
+                    'tool' => $this->detectToolFromFilename($filename),
+                    'path' => $path,
+                    'filename' => $filename,
+                ];
+            })
+            ->values();
+    }
+
+    protected function readSampleFileContents(array $file): string
+    {
+        return match ($file['source'] ?? 'local') {
+            's3' => $this->readS3SampleFileContents(
+                disk: $file['disk'] ?? $this->getS3Disk(),
+                path: $file['path'],
+            ),
+            default => $this->readLocalSampleFileContents($file['path']),
+        };
+    }
+
+    protected function readLocalSampleFileContents(string $path): string
+    {
+        if (! File::exists($path)) {
+            throw new RuntimeException("Local scan sample file does not exist: {$path}");
+        }
+
+        return (string) File::get($path);
+    }
+
+    protected function readS3SampleFileContents(string $disk, string $path): string
+    {
+        $stream = Storage::disk($disk)->readStream($path);
+
+        if (! is_resource($stream)) {
+            throw new RuntimeException("Unable to open S3 stream for scan sample: {$path}");
+        }
+
+        $contents = '';
+
+        try {
+            while (! feof($stream)) {
+                $chunk = fread($stream, 1024 * 1024);
+
+                if ($chunk === false) {
+                    throw new RuntimeException("Unable to read S3 stream for scan sample: {$path}");
+                }
+
+                $contents .= $chunk;
+            }
+        } finally {
+            fclose($stream);
+        }
+
+        return $contents;
+    }
+
+    protected function getScanSource(): string
+    {
+        return Str::lower((string) env('SCAN_SOURCE', 'local'));
+    }
+
+    protected function getS3Disk(): string
+    {
+        return (string) env('SCAN_S3_DISK', 's3');
+    }
+
+    protected function listS3SamplePaths(string $disk, string $prefix, int $maxFiles, int $perToolLimit, array $requestedTools = []): array
+    {
+        $bucket = (string) config("filesystems.disks.{$disk}.bucket");
+
+        if (blank($bucket)) {
+            throw new RuntimeException("S3 bucket is not configured for disk [{$disk}].");
+        }
+
+        $client = $this->makeS3Client($disk);
+        $normalizedPrefix = $prefix === '' ? '' : $prefix . '/';
+        $pageSize = max(10, min(250, (int) env('SCAN_S3_PAGE_SIZE', 100)));
+        $allowedTools = collect($requestedTools)
+            ->filter(fn ($tool): bool => is_string($tool) && filled($tool))
+            ->map(fn (string $tool): string => Str::lower($tool))
+            ->values();
+        $supportedToolCount = max(
+            1,
+            $allowedTools->isNotEmpty()
+                ? $allowedTools->unique()->count()
+                : count(array_keys(TaskExecutionService::getAvailableTools())),
+        );
+        $targetCount = min($maxFiles, $supportedToolCount * $perToolLimit);
+        $paths = [];
+        $countsByTool = [];
+        $continuationToken = null;
+
+        do {
+            $params = [
+                'Bucket' => $bucket,
+                'Prefix' => $normalizedPrefix,
+                'MaxKeys' => $pageSize,
+            ];
+
+            if (filled($continuationToken)) {
+                $params['ContinuationToken'] = $continuationToken;
+            }
+
+            $result = $client->listObjectsV2($params);
+
+            foreach (($result['Contents'] ?? []) as $object) {
+                $key = (string) ($object['Key'] ?? '');
+
+                if (! Str::endsWith(Str::lower($key), '.json')) {
+                    continue;
+                }
+
+                $tool = $this->detectToolFromFilename(basename($key));
+
+                if (blank($tool)) {
+                    continue;
+                }
+
+                if ($allowedTools->isNotEmpty() && ! $allowedTools->contains(Str::lower($tool))) {
+                    continue;
+                }
+
+                if (($countsByTool[$tool] ?? 0) >= $perToolLimit) {
+                    continue;
+                }
+
+                $paths[] = $key;
+                $countsByTool[$tool] = ($countsByTool[$tool] ?? 0) + 1;
+
+                if (count($paths) >= $targetCount) {
+                    break 2;
+                }
+            }
+
+            $continuationToken = $result['NextContinuationToken'] ?? null;
+        } while (($result['IsTruncated'] ?? false) && filled($continuationToken));
+
+        return $paths;
+    }
+
+    protected function makeS3Client(string $disk): S3Client
+    {
+        $config = config("filesystems.disks.{$disk}");
+
+        if (! is_array($config)) {
+            throw new RuntimeException("Filesystem disk [{$disk}] is not configured.");
+        }
+
+        $clientConfig = [
+            'version' => 'latest',
+            'region' => $config['region'] ?? env('AWS_DEFAULT_REGION'),
+            'use_path_style_endpoint' => (bool) ($config['use_path_style_endpoint'] ?? false),
+        ];
+
+        if (filled($config['endpoint'] ?? null)) {
+            $clientConfig['endpoint'] = $config['endpoint'];
+        }
+
+        if (filled($config['key'] ?? null) && filled($config['secret'] ?? null)) {
+            $clientConfig['credentials'] = array_filter([
+                'key' => $config['key'],
+                'secret' => $config['secret'],
+                'token' => $config['token'] ?? null,
+            ]);
+        } elseif (filled($config['profile'] ?? null)) {
+            $clientConfig['profile'] = $config['profile'];
+        }
+
+        return new S3Client($clientConfig);
+    }
+
+    protected function decodeSamplePayload(string $contents): ?array
+    {
+        $trimmed = trim(preg_replace('/^\xEF\xBB\xBF/', '', $contents) ?? $contents);
+
+        foreach ($this->yieldCandidateJsonStrings($trimmed) as $candidate) {
+            $decoded = json_decode($candidate, true);
+
+            if (is_array($decoded)) {
+                return $decoded;
+            }
+
+            if (is_string($decoded)) {
+                $decodedString = json_decode($decoded, true);
+
+                if (is_array($decodedString)) {
+                    return $decodedString;
+                }
+            }
+
+            foreach ($this->yieldEscapedJsonCandidates($candidate) as $escapedCandidate) {
+                $decodedEscaped = json_decode($escapedCandidate, true);
+
+                if (is_array($decodedEscaped)) {
+                    return $decodedEscaped;
+                }
+            }
+
+            $pseudoJson = $this->normalizePseudoJsonString($candidate);
+
+            if ($pseudoJson !== null) {
+                $decodedPseudoJson = json_decode($pseudoJson, true);
+
+                if (is_array($decodedPseudoJson)) {
+                    return $decodedPseudoJson;
+                }
+            }
+
+            $pythonLiteral = $this->parsePythonLiteralPayload($candidate);
+
+            if (is_array($pythonLiteral)) {
+                return $pythonLiteral;
+            }
+        }
+
+        return null;
+    }
+
+    protected function yieldCandidateJsonStrings(string $contents): \Generator
+    {
+        if ($contents === '') {
+            return;
+        }
+
+        yield $contents;
+
+        if (strlen($contents) > 1024 * 1024) {
+            return;
+        }
+
+        $firstChar = $contents[0];
+
+        if (in_array($firstChar, ['{', '[', '"'], true)) {
+            return;
+        }
+
+        $firstBrace = strpos($contents, '{');
+        $lastBrace = strrpos($contents, '}');
+
+        if ($firstBrace !== false && $lastBrace !== false && $lastBrace > $firstBrace) {
+            yield substr($contents, $firstBrace, $lastBrace - $firstBrace + 1);
+        }
+
+        $firstBracket = strpos($contents, '[');
+        $lastBracket = strrpos($contents, ']');
+
+        if (
+            $firstBracket !== false &&
+            $lastBracket !== false &&
+            $lastBracket > $firstBracket &&
+            ($firstBrace === false || $firstBracket < $firstBrace)
+        ) {
+            yield substr($contents, $firstBracket, $lastBracket - $firstBracket + 1);
+        }
+    }
+
+    protected function normalizePayload(array $payload): array
+    {
+        foreach (['stdout', 'payload', 'data', 'result', 'body'] as $key) {
+            $value = $payload[$key] ?? null;
+
+            if (
+                is_string($value) &&
+                filled(trim($value)) &&
+                $this->looksLikeEncodedJson($value)
+            ) {
+                $decoded = $this->decodeSamplePayload($value);
+
+                if (is_array($decoded)) {
+                    $payload[$key] = $decoded;
+                }
+            }
+        }
+
+        if (! isset($payload['stdout']) || ! is_array($payload['stdout'])) {
+            if ($this->looksLikeToolPayload($payload)) {
+                $payload = ['stdout' => $payload] + $payload;
+            } else {
+                foreach (['payload', 'data', 'result', 'body'] as $key) {
+                    if (isset($payload[$key]) && is_array($payload[$key]) && $this->looksLikeToolPayload($payload[$key])) {
+                        $payload['stdout'] = $payload[$key];
+                        break;
+                    }
+                }
+            }
+        }
+
+        return $payload;
+    }
+
+    protected function looksLikeToolPayload(array $payload): bool
+    {
+        return
+            isset($payload['Controls']) ||
+            isset($payload['Totals']) ||
+            isset($payload['summaryDetails']) ||
+            isset($payload['results']) ||
+            isset($payload['Findings']) ||
+            isset($payload['nmaprun']) ||
+            isset($payload['check_type']);
+    }
+
+    protected function looksLikeEncodedJson(string $value): bool
+    {
+        $trimmed = ltrim($value);
+
+        return in_array($trimmed[0] ?? '', ['{', '[', '"'], true)
+            || Str::contains($trimmed, ['{\\"', '[\\"', '\\"Controls\\"', '\\"results\\"', '\\"Findings\\"']);
+    }
+
+    protected function yieldEscapedJsonCandidates(string $candidate): \Generator
+    {
+        if (! Str::contains($candidate, ['\\"', '\\n', '\\r', '\\t'])) {
+            return;
+        }
+
+        $stripped = stripslashes($candidate);
+
+        if ($stripped !== $candidate && $stripped !== '') {
+            yield $stripped;
+        }
+    }
+
+    protected function normalizePseudoJsonString(string $candidate): ?string
+    {
+        $trimmed = trim($candidate);
+
+        if (! Str::startsWith($trimmed, ['{', '[']) || ! Str::contains($trimmed, "':")) {
+            return null;
+        }
+
+        $result = '';
+        $token = '';
+        $inSingleQuotedString = false;
+        $length = strlen($trimmed);
+
+        $flushToken = function () use (&$token, &$result): void {
+            if ($token === '') {
+                return;
+            }
+
+            $result .= match ($token) {
+                'None' => 'null',
+                'True' => 'true',
+                'False' => 'false',
+                default => $token,
+            };
+
+            $token = '';
+        };
+
+        for ($index = 0; $index < $length; $index++) {
+            $char = $trimmed[$index];
+
+            if ($inSingleQuotedString) {
+                if ($char === '\\' && $index + 1 < $length) {
+                    $next = $trimmed[$index + 1];
+                    $result .= match ($next) {
+                        '\\' => '\\\\',
+                        '\'' => '\'',
+                        '"' => '\\"',
+                        'n' => '\\n',
+                        'r' => '\\r',
+                        't' => '\\t',
+                        default => '\\\\' . $next,
+                    };
+                    $index++;
+
+                    continue;
+                }
+
+                if ($char === '\'') {
+                    $result .= '"';
+                    $inSingleQuotedString = false;
+
+                    continue;
+                }
+
+                $result .= match ($char) {
+                    '"' => '\\"',
+                    "\n" => '\\n',
+                    "\r" => '\\r',
+                    "\t" => '\\t',
+                    default => $char,
+                };
+
+                continue;
+            }
+
+            if ($char === '\'') {
+                $flushToken();
+                $result .= '"';
+                $inSingleQuotedString = true;
+
+                continue;
+            }
+
+            if (ctype_alpha($char)) {
+                $token .= $char;
+
+                continue;
+            }
+
+            $flushToken();
+            $result .= $char;
+        }
+
+        $flushToken();
+
+        return $inSingleQuotedString ? null : $result;
+    }
+
+    protected function parsePythonLiteralPayload(string $candidate): ?array
+    {
+        $trimmed = trim($candidate);
+
+        if (! Str::startsWith($trimmed, ['{', '['])) {
+            return null;
+        }
+
+        $index = 0;
+        $value = $this->parsePythonLiteralValue($trimmed, $index);
+
+        if (! is_array($value)) {
+            return null;
+        }
+
+        $this->skipPythonLiteralWhitespace($trimmed, $index);
+
+        return $index === strlen($trimmed) ? $value : null;
+    }
+
+    protected function parsePythonLiteralValue(string $input, int &$index): mixed
+    {
+        $this->skipPythonLiteralWhitespace($input, $index);
+
+        if ($index >= strlen($input)) {
+            return null;
+        }
+
+        return match ($input[$index]) {
+            '{' => $this->parsePythonLiteralObject($input, $index),
+            '[' => $this->parsePythonLiteralArray($input, $index),
+            '\'', '"' => $this->parsePythonLiteralString($input, $index),
+            default => $this->parsePythonLiteralScalar($input, $index),
+        };
+    }
+
+    protected function parsePythonLiteralObject(string $input, int &$index): ?array
+    {
+        $object = [];
+        $index++;
+
+        while (true) {
+            $this->skipPythonLiteralWhitespace($input, $index);
+
+            if (($input[$index] ?? null) === '}') {
+                $index++;
+
+                return $object;
+            }
+
+            $key = $this->parsePythonLiteralValue($input, $index);
+
+            if (! is_string($key)) {
+                return null;
+            }
+
+            $this->skipPythonLiteralWhitespace($input, $index);
+
+            if (($input[$index] ?? null) !== ':') {
+                return null;
+            }
+
+            $index++;
+            $value = $this->parsePythonLiteralValue($input, $index);
+            $object[$key] = $value;
+
+            $this->skipPythonLiteralWhitespace($input, $index);
+            $char = $input[$index] ?? null;
+
+            if ($char === ',') {
+                $index++;
+
+                continue;
+            }
+
+            if ($char === '}') {
+                $index++;
+
+                return $object;
+            }
+
+            return null;
+        }
+    }
+
+    protected function parsePythonLiteralArray(string $input, int &$index): ?array
+    {
+        $array = [];
+        $index++;
+
+        while (true) {
+            $this->skipPythonLiteralWhitespace($input, $index);
+
+            if (($input[$index] ?? null) === ']') {
+                $index++;
+
+                return $array;
+            }
+
+            $array[] = $this->parsePythonLiteralValue($input, $index);
+            $this->skipPythonLiteralWhitespace($input, $index);
+            $char = $input[$index] ?? null;
+
+            if ($char === ',') {
+                $index++;
+
+                continue;
+            }
+
+            if ($char === ']') {
+                $index++;
+
+                return $array;
+            }
+
+            return null;
+        }
+    }
+
+    protected function parsePythonLiteralString(string $input, int &$index): ?string
+    {
+        $quote = $input[$index] ?? null;
+
+        if (! in_array($quote, ['\'', '"'], true)) {
+            return null;
+        }
+
+        $index++;
+        $result = '';
+        $length = strlen($input);
+
+        while ($index < $length) {
+            $char = $input[$index];
+
+            if ($char === '\\' && $index + 1 < $length) {
+                $next = $input[$index + 1];
+                $result .= match ($next) {
+                    'n' => "\n",
+                    'r' => "\r",
+                    't' => "\t",
+                    '\\' => '\\',
+                    '\'' => '\'',
+                    '"' => '"',
+                    default => $next,
+                };
+                $index += 2;
+
+                continue;
+            }
+
+            if ($char === $quote) {
+                $index++;
+
+                return $result;
+            }
+
+            $result .= $char;
+            $index++;
+        }
+
+        return null;
+    }
+
+    protected function parsePythonLiteralScalar(string $input, int &$index): mixed
+    {
+        $length = strlen($input);
+        $start = $index;
+
+        while ($index < $length && ! in_array($input[$index], [',', '}', ']', ' ', "\n", "\r", "\t"], true)) {
+            $index++;
+        }
+
+        $token = substr($input, $start, $index - $start);
+
+        return match ($token) {
+            'True' => true,
+            'False' => false,
+            'None' => null,
+            default => is_numeric($token) ? ($token + 0) : $token,
+        };
+    }
+
+    protected function skipPythonLiteralWhitespace(string $input, int &$index): void
+    {
+        $length = strlen($input);
+
+        while ($index < $length && in_array($input[$index], [' ', "\n", "\r", "\t"], true)) {
+            $index++;
+        }
+    }
+
+    protected function matchesSupportedScanFilename(string $filename): bool
+    {
+        return filled($this->detectToolFromFilename($filename));
     }
 
     protected function parseKubebench(array $context): Collection
     {
-        $controls = $context['payload']['stdout']['Controls'] ?? [];
+        $stdout = $context['payload']['stdout'] ?? [];
+
+        if (is_string($stdout) && filled(trim($stdout))) {
+            $decodedStdout = $this->decodeToolPayloadString($stdout);
+
+            if (is_array($decodedStdout)) {
+                $stdout = $decodedStdout;
+            }
+        }
+
+        $controls = $stdout['Controls'] ?? $stdout['controls'] ?? $context['payload']['Controls'] ?? [];
 
         return collect($controls)
             ->flatMap(function (array $control) use ($context): array {
@@ -201,7 +916,38 @@ class ScanService
 
     protected function parseCheckov(array $context): Collection
     {
-        $results = $context['payload']['stdout']['results'] ?? [];
+        $stdout = $context['payload']['stdout'] ?? [];
+
+        if (is_string($stdout) && filled(trim($stdout))) {
+            $decodedStdout = $this->decodeToolPayloadString($stdout);
+
+            if (is_array($decodedStdout)) {
+                $stdout = $decodedStdout;
+            }
+        }
+
+        if (is_string($stdout) && filled(trim($stdout))) {
+            return collect([
+                $this->makeFinding(
+                    context: $context,
+                    statusBucket: 'FAIL',
+                    description: $this->summarizeCheckovExecutionOutput($stdout),
+                    recommendation: $this->buildCheckovExecutionRecommendation($stdout),
+                    object: $context['cluster_name'] ?: 'Checkov scan execution',
+                    metadata: [
+                        'tool' => 'checkov',
+                        'status' => 'EXECUTION_ERROR',
+                        'section' => 'execution',
+                        'resource' => $context['cluster_name'] ?: 'Checkov scan execution',
+                        'object' => $context['cluster_name'] ?: 'Checkov scan execution',
+                        'raw_output_excerpt' => Str::limit(preg_replace('/\s+/', ' ', $stdout), 1000),
+                    ],
+                    suggestion: 'Fix the Checkov scanner execution issue, rerun the scan, and review the findings again.',
+                ),
+            ]);
+        }
+
+        $results = is_array($stdout) ? ($stdout['results'] ?? []) : [];
         $groups = [
             'failed_checks' => 'FAIL',
             'passed_checks' => 'PASS',
@@ -242,6 +988,45 @@ class ScanService
                     ->all();
             })
             ->values();
+    }
+
+    protected function decodeToolPayloadString(string $payload): ?array
+    {
+        $decoded = $this->decodeSamplePayload($payload);
+
+        if (is_array($decoded)) {
+            return $decoded;
+        }
+
+        $pseudoJson = $this->normalizePseudoJsonString($payload);
+
+        if ($pseudoJson === null) {
+            return null;
+        }
+
+        $decodedPseudoJson = json_decode($pseudoJson, true);
+
+        return is_array($decodedPseudoJson) ? $decodedPseudoJson : null;
+    }
+
+    protected function summarizeCheckovExecutionOutput(string $stdout): string
+    {
+        $normalized = trim((string) preg_replace('/\s+/', ' ', $stdout));
+
+        if (Str::contains(Str::lower($normalized), 'forbidden')) {
+            return 'Checkov scan could not collect Kubernetes resources because the scanner service account does not have sufficient RBAC permissions.';
+        }
+
+        return Str::limit($normalized, 240);
+    }
+
+    protected function buildCheckovExecutionRecommendation(string $stdout): string
+    {
+        if (Str::contains(Str::lower($stdout), 'forbidden')) {
+            return 'Grant the Checkov scanner service account the required Kubernetes RBAC permissions for the resources it needs to list, then rerun the scan.';
+        }
+
+        return 'Review the Checkov execution output, fix the scanner runtime issue, and rerun the scan.';
     }
 
     protected function parseRbacTool(array $context): Collection
@@ -288,9 +1073,26 @@ class ScanService
 
     protected function parseNmap(array $context): Collection
     {
-        return collect($context['payload']['stdout'] ?? [])
-            ->flatMap(function (array $scanEntry, string $scanKey) use ($context): array {
-                $nmapRun = $scanEntry['nmaprun'] ?? [];
+        return $this->extractNmapEntries($context['payload']['stdout'] ?? $context['payload'])
+            ->flatMap(function ($scanEntry, string $scanKey) use ($context): array {
+                if (! is_array($scanEntry)) {
+                    return [];
+                }
+
+                if (is_string($scanEntry) && filled(trim($scanEntry))) {
+                    $scanEntry = $this->decodeSamplePayload($scanEntry) ?? $scanEntry;
+                }
+
+                if (! is_array($scanEntry)) {
+                    return [];
+                }
+
+                $nmapRun = $scanEntry['nmaprun'] ?? $scanEntry;
+
+                if (! is_array($nmapRun)) {
+                    return [];
+                }
+
                 $host = $nmapRun['host'] ?? [];
                 $address = data_get($host, 'address.@addr');
                 $hostname = data_get($host, 'hostnames.hostname.@name');
@@ -298,7 +1100,7 @@ class ScanService
                 $ports = is_array($ports) && array_is_list($ports) ? $ports : (filled($ports) ? [$ports] : []);
 
                 return collect($ports)
-                    ->filter(fn (array $port): bool => Str::lower((string) data_get($port, 'state.@state')) === 'open')
+                    ->filter(fn ($port): bool => is_array($port) && Str::lower((string) data_get($port, 'state.@state')) === 'open')
                     ->map(function (array $port) use ($context, $scanKey, $address, $hostname, $nmapRun): array {
                         $portId = (string) data_get($port, '@portid', 'unknown');
                         $protocol = Str::lower((string) data_get($port, '@protocol', 'tcp'));
@@ -338,6 +1140,41 @@ class ScanService
                         );
                     })
                     ->all();
+            })
+            ->values();
+    }
+
+    protected function extractNmapEntries(mixed $stdout): Collection
+    {
+        if (is_string($stdout) && filled(trim($stdout))) {
+            $stdout = $this->decodeSamplePayload($stdout) ?? $stdout;
+        }
+
+        if (! is_array($stdout)) {
+            return collect();
+        }
+
+        if (isset($stdout['nmaprun']) || isset($stdout['host']) || isset($stdout['ports'])) {
+            return collect([['nmaprun' => isset($stdout['nmaprun']) ? $stdout['nmaprun'] : $stdout]]);
+        }
+
+        return collect($stdout)
+            ->map(function ($entry) {
+                if (is_string($entry) && filled(trim($entry))) {
+                    return $this->decodeSamplePayload($entry) ?? $entry;
+                }
+
+                return $entry;
+            })
+            ->filter(function ($entry): bool {
+                if (! is_array($entry)) {
+                    return false;
+                }
+
+                return isset($entry['nmaprun']) || isset($entry['host']) || isset($entry['ports']);
+            })
+            ->map(function (array $entry): array {
+                return isset($entry['nmaprun']) ? $entry : ['nmaprun' => $entry];
             })
             ->values();
     }
@@ -407,13 +1244,22 @@ class ScanService
     protected function detectToolFromFilename(string $filename): ?string
     {
         $lower = Str::lower($filename);
+        $normalized = str_replace(['_', ' '], '-', $lower);
 
         return match (true) {
-            Str::startsWith($lower, 'kubebench-') => 'kubebench',
-            Str::startsWith($lower, 'kubescape-') => 'kubescape',
-            Str::startsWith($lower, 'checkov-') => 'checkov',
-            Str::startsWith($lower, 'nmap') => 'nmap',
-            Str::startsWith($lower, 'rbac-') => 'rbac-tool',
+            Str::startsWith($lower, 'kubebench-'),
+            Str::contains($lower, 'result-kubebench'),
+            Str::contains($normalized, 'result-kube-bench') => 'kubebench',
+            Str::startsWith($lower, 'kubescape-'),
+            Str::contains($lower, 'result-kubescape') => 'kubescape',
+            Str::startsWith($lower, 'checkov-'),
+            Str::contains($lower, 'result-checkov') => 'checkov',
+            Str::startsWith($lower, 'nmap'),
+            Str::contains($lower, 'result-nmap') => 'nmap',
+            Str::startsWith($lower, 'rbac-'),
+            Str::contains($lower, 'result-rbac'),
+            Str::contains($lower, 'result-rbac-tool'),
+            Str::contains($normalized, 'result-rbac-tool') => 'rbac-tool',
             default => null,
         };
     }
@@ -423,10 +1269,10 @@ class ScanService
         $stdout = $payload['stdout'] ?? [];
 
         return match (true) {
-            isset($stdout['Controls'], $stdout['Totals']) => 'kubebench',
+            isset($stdout['Controls']) || isset($stdout['controls']) => 'kubebench',
             isset($stdout['summaryDetails'], $stdout['results']) => 'kubescape',
             isset($stdout['summary'], $stdout['results']) && isset($stdout['check_type']) => 'checkov',
-            collect($stdout)->contains(fn ($entry): bool => is_array($entry) && isset($entry['nmaprun'])) => 'nmap',
+            isset($stdout['nmaprun']) || isset($stdout['host']) || collect($stdout)->contains(fn ($entry): bool => is_array($entry) && (isset($entry['nmaprun']) || isset($entry['host']) || isset($entry['ports']))) => 'nmap',
             isset($stdout['Findings'], $stdout['Stats']) => 'rbac-tool',
             default => null,
         };

@@ -4,7 +4,6 @@ namespace App\Filament\Resources;
 
 use App\Filament\Resources\ClusterAgentResource\Pages;
 use App\Models\ClusterAgent;
-use Filament\Forms\Components\TextInput;
 use Filament\Resources\Resource;
 use Filament\Schemas\Schema;
 use Filament\Tables;
@@ -20,48 +19,50 @@ class ClusterAgentResource extends Resource
 
     public static function form(Schema $schema): Schema
     {
-        return $schema->components([
-            TextInput::make('name')
-                ->required()
-                ->maxLength(255),
-            TextInput::make('cluster_name')
-                ->required()
-                ->maxLength(255),
-            TextInput::make('endpoint')
-                ->label('API / Agent Endpoint')
-                ->url()
-                ->maxLength(255),
-        ]);
+        return $schema->components([]);
     }
 
     public static function table(Table $table): Table
     {
         return $table
-            ->defaultSort('name')
+            ->defaultSort('cluster_name')
             ->columns([
-                Tables\Columns\TextColumn::make('name')
-                    ->searchable()
-                    ->sortable(),
                 Tables\Columns\TextColumn::make('cluster_name')
-                    ->label('Cluster')
+                    ->label('Cluster Agent')
                     ->searchable()
                     ->sortable(),
-                Tables\Columns\TextColumn::make('endpoint')
-                    ->label('Endpoint')
+                Tables\Columns\TextColumn::make('label')
                     ->searchable()
-                    ->toggleable(),
-                Tables\Columns\IconColumn::make('is_active')
-                    ->label('Active')
-                    ->boolean(),
+                    ->sortable(),
+                Tables\Columns\TextColumn::make('provider')
+                    ->badge()
+                    ->searchable()
+                    ->sortable(),
+                Tables\Columns\TextColumn::make('region')
+                    ->searchable()
+                    ->sortable(),
+                Tables\Columns\TextColumn::make('status')
+                    ->badge()
+                    ->color(fn (?string $state): string => match (strtolower((string) $state)) {
+                        'healthy', 'active', 'running', 'online' => 'success',
+                        'warning', 'degraded' => 'warning',
+                        'failed', 'unhealthy', 'offline', 'error' => 'danger',
+                        default => 'gray',
+                    })
+                    ->formatStateUsing(fn (?string $state): string => $state ?: 'unknown')
+                    ->searchable()
+                    ->sortable(),
+                Tables\Columns\TextColumn::make('available_tools')
+                    ->label('Tools')
+                    ->badge()
+                    ->separator(',')
+                    ->wrap(),
                 Tables\Columns\TextColumn::make('created_at')
-                    ->label('Registered')
+                    ->label('Synced')
                     ->dateTime('d M Y H:i')
                     ->sortable(),
             ])
-            ->filters([
-                Tables\Filters\TernaryFilter::make('is_active')
-                    ->label('Agent Status'),
-            ]);
+            ->filters([]);
     }
 
     public static function getPages(): array

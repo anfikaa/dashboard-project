@@ -23,7 +23,7 @@ class TopFindings extends TableWidget
     {
         return $table
             ->heading('Top Findings')
-            ->description('Search across failed findings parsed directly from the JSON scan samples in storage/app/scan.')
+            ->description('Search across failed findings parsed directly from the configured scan source.')
             ->searchable()
             ->searchPlaceholder('Search scan id, tool, cluster, status, finding, remediation...')
             ->paginated([10, 25, 50])

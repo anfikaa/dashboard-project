@@ -49,15 +49,17 @@ return [
 
         's3' => [
             'driver' => 's3',
-            'key' => env('AWS_ACCESS_KEY_ID'),
-            'secret' => env('AWS_SECRET_ACCESS_KEY'),
+            'key' => env('AWS_ACCESS_KEY_ID') ?: null,
+            'secret' => env('AWS_SECRET_ACCESS_KEY') ?: null,
+            'token' => env('AWS_SESSION_TOKEN') ?: null,
+            'profile' => env('AWS_PROFILE') ?: null,
             'region' => env('AWS_DEFAULT_REGION'),
             'bucket' => env('AWS_BUCKET'),
             'url' => env('AWS_URL'),
             'endpoint' => env('AWS_ENDPOINT'),
             'use_path_style_endpoint' => env('AWS_USE_PATH_STYLE_ENDPOINT', false),
-            'throw' => false,
-            'report' => false,
+            'throw' => env('AWS_FILESYSTEM_THROW', true),
+            'report' => env('AWS_FILESYSTEM_REPORT', true),
         ],
 
     ],

@@ -10,7 +10,11 @@ class ClusterAgent extends Model
 {
     protected $fillable = [
         'name',
+        'label',
         'cluster_name',
+        'provider',
+        'region',
+        'status',
         'endpoint',
         'available_tools',
         'is_active',

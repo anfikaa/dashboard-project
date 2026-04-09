@@ -23,7 +23,7 @@ class Dashboard extends BaseDashboard
 
     public function getSubheading(): string | Htmlable | null
     {
-        return 'Overview of security findings parsed directly from the sample JSON files in storage/app/scan.';
+        return 'Overview of security findings parsed directly from the configured scan source.';
     }
 
     protected function getHeaderWidgets(): array
