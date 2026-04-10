@@ -41,7 +41,7 @@ class SecurityTask extends Model
     {
         static::creating(function (self $task): void {
             if (blank($task->task_id)) {
-                $task->task_id = 'TASK-' . now()->format('YmdHis') . '-' . Str::upper(Str::random(4));
+                $task->task_id = (string) Str::uuid();
             }
 
             $task->status ??= SecurityTaskStatus::Pending;

@@ -53,14 +53,14 @@ class DynamoDbClusterAgentService
     {
         $ttl = max(1, (int) env('CLUSTER_AGENT_CACHE_TTL_SECONDS', 60));
         $cacheKey = 'cluster-agents.dynamodb.' . md5(json_encode([
-            'table' => env('AWS_DYNAMODB_TABLE'),
+            'table' => $this->tableName(),
             'region' => env('AWS_DYNAMODB_REGION'),
         ]));
 
         return Cache::remember($cacheKey, now()->addSeconds($ttl), function (): array {
             $client = $this->makeClient();
             $marshaler = new Marshaler();
-            $table = (string) env('AWS_DYNAMODB_TABLE');
+            $table = $this->tableName();
             $items = [];
             $lastEvaluatedKey = null;
 
@@ -114,7 +114,11 @@ class DynamoDbClusterAgentService
             'provider' => $provider ?: 'Unknown',
             'region' => $region ?: 'Unknown',
             'status' => $status ?: 'unknown',
-            'available_tools' => $this->normalizeTools($tools),
+            'available_tools' => collect($this->normalizeTools($tools))
+                ->filter()
+                ->unique()
+                ->values()
+                ->all(),
         ];
     }
 
@@ -122,6 +126,7 @@ class DynamoDbClusterAgentService
     {
         if (is_string($tools)) {
             return collect(preg_split('/\s*,\s*/', $tools) ?: [])
+                ->map(fn ($tool): ?string => $this->normalizeToolName($tool))
                 ->filter()
                 ->values()
                 ->all();
@@ -132,13 +137,13 @@ class DynamoDbClusterAgentService
                 return collect($tools)
                     ->filter(fn ($enabled): bool => filter_var($enabled, FILTER_VALIDATE_BOOL) || $enabled === true || $enabled === 1)
                     ->keys()
-                    ->map(fn ($tool): string => (string) $tool)
+                    ->map(fn ($tool): ?string => $this->normalizeToolName($tool))
                     ->values()
                     ->all();
             }
 
             return collect($tools)
-                ->map(fn ($tool): string => is_scalar($tool) ? (string) $tool : json_encode($tool))
+                ->map(fn ($tool): ?string => $this->normalizeToolName(is_scalar($tool) ? (string) $tool : json_encode($tool)))
                 ->filter()
                 ->values()
                 ->all();
@@ -158,6 +163,32 @@ class DynamoDbClusterAgentService
         }
 
         return null;
+    }
+
+    protected function normalizeToolName(mixed $tool): ?string
+    {
+        if (! is_scalar($tool)) {
+            return null;
+        }
+
+        $value = Str::of((string) $tool)
+            ->trim()
+            ->lower()
+            ->replace('_', '-')
+            ->value();
+
+        if ($value === '') {
+            return null;
+        }
+
+        return match ($value) {
+            'kube-bench', 'kubebench' => 'kubebench',
+            'kube-escape', 'kubescape' => 'kubescape',
+            'rbac', 'rbac-tool', 'rbac_tool' => 'rbac-tool',
+            'n-map', 'nmap' => 'nmap',
+            'check-ov', 'checkov' => 'checkov',
+            default => $value,
+        };
     }
 
     protected function makeClient(): DynamoDbClient
@@ -184,5 +215,10 @@ class DynamoDbClusterAgentService
         }
 
         return new DynamoDbClient($config);
+    }
+
+    protected function tableName(): string
+    {
+        return (string) env('CLUSTER_AGENT_DYNAMODB_TABLE', 'intern_cluster_register');
     }
 }

@@ -26,10 +26,11 @@ class TopFindings extends TableWidget
             ->description('Search across failed findings parsed directly from the configured scan source.')
             ->searchable()
             ->searchPlaceholder('Search scan id, tool, cluster, status, finding, remediation...')
+            ->defaultSort('scanned_at', 'desc')
             ->paginated([10, 25, 50])
             ->defaultPaginationPageOption(10)
             ->striped()
-            ->records(fn (?string $search): Collection => $this->getFilteredRecords($search))
+            ->records(fn (?string $search, ?string $sortColumn, ?string $sortDirection): Collection => $this->getFilteredRecords($search, $sortColumn, $sortDirection))
             ->columns([
                 Tables\Columns\TextColumn::make('scan_id')
                     ->label('Scan ID')
@@ -37,8 +38,9 @@ class TopFindings extends TableWidget
                     ->extraHeaderAttributes(['style' => 'width: 11rem;'])
                     ->extraAttributes(['style' => 'width: 11rem; min-width: 11rem;']),
 
-                Tables\Columns\TextColumn::make('scan_datetime')
+                Tables\Columns\TextColumn::make('scanned_at')
                     ->label('Datetime')
+                    ->formatStateUsing(fn ($state, array $record): string => $record['scan_datetime'] ?? '-')
                     ->sortable()
                     ->extraHeaderAttributes(['style' => 'width: 11rem;'])
                     ->extraAttributes(['style' => 'width: 11rem; min-width: 11rem;']),
@@ -119,9 +121,20 @@ class TopFindings extends TableWidget
             ]);
     }
 
-    protected function getFilteredRecords(?string $search = null): Collection
+    protected function getFilteredRecords(?string $search = null, ?string $sortColumn = null, ?string $sortDirection = null): Collection
     {
-        return app(DashboardResultService::class)->getTopFindings($this->pageFilters, $search)
-            ->mapWithKeys(fn (array $record): array => [$record['key'] => $record]);
+        $records = app(DashboardResultService::class)->getTopFindings($this->pageFilters, $search);
+
+        if (filled($sortColumn)) {
+            $records = $records
+                ->sortBy(
+                    fn (array $record): mixed => $record[$sortColumn] ?? null,
+                    options: SORT_NATURAL,
+                    descending: $sortDirection === 'desc',
+                )
+                ->values();
+        }
+
+        return $records->mapWithKeys(fn (array $record): array => [$record['key'] => $record]);
     }
 }

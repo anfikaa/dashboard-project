@@ -29,6 +29,6 @@ class CreateSecurityTask extends CreateRecord
 
     protected function getCreatedNotificationTitle(): ?string
     {
-        return 'Task submitted and executed.';
+        return 'Task submitted and dispatched.';
     }
 }

@@ -70,6 +70,36 @@ class ScanService
             ->values();
     }
 
+    public function parseFile(array $file): Collection
+    {
+        return $this->parseSampleFile($file);
+    }
+
+    public function getS3ResultFiles(string $prefix, ?string $disk = null): Collection
+    {
+        $resolvedDisk = $disk ?: $this->getS3Disk();
+        $normalizedPrefix = trim($prefix, '/');
+
+        if ($normalizedPrefix === '') {
+            return collect();
+        }
+
+        return collect(Storage::disk($resolvedDisk)->allFiles($normalizedPrefix))
+            ->filter(fn (string $path): bool => Str::endsWith(Str::lower($path), '.json'))
+            ->map(function (string $path) use ($resolvedDisk): array {
+                $filename = basename($path);
+
+                return [
+                    'source' => 's3',
+                    'disk' => $resolvedDisk,
+                    'tool' => $this->detectToolFromFilename($filename),
+                    'path' => $path,
+                    'filename' => $filename,
+                ];
+            })
+            ->values();
+    }
+
     public function summarize(Collection $findings): array
     {
         $summary = [
@@ -466,7 +496,7 @@ class ScanService
 
     protected function normalizePayload(array $payload): array
     {
-        foreach (['stdout', 'payload', 'data', 'result', 'body'] as $key) {
+        foreach (['stdout', 'payload', 'data', 'result', 'body', 'partial_results', 'stderr'] as $key) {
             $value = $payload[$key] ?? null;
 
             if (
@@ -482,11 +512,43 @@ class ScanService
             }
         }
 
+        if (
+            (
+                ! isset($payload['stdout']) ||
+                (is_string($payload['stdout']) && blank(trim($payload['stdout']))) ||
+                $payload['stdout'] === []
+            ) &&
+            is_string($payload['partial_results'] ?? null) &&
+            filled(trim($payload['partial_results']))
+        ) {
+            $decodedPartialResults = $this->decodeCheckovPayloadString($payload['partial_results']);
+
+            if (is_array($decodedPartialResults)) {
+                $payload['stdout'] = $decodedPartialResults;
+            }
+        }
+
+        if (
+            (
+                ! isset($payload['stdout']) ||
+                (is_string($payload['stdout']) && blank(trim($payload['stdout']))) ||
+                $payload['stdout'] === []
+            ) &&
+            is_string($payload['stderr'] ?? null) &&
+            filled(trim($payload['stderr']))
+        ) {
+            $decodedStderr = $this->decodeCheckovPayloadString($payload['stderr']);
+
+            if (is_array($decodedStderr)) {
+                $payload['stdout'] = $decodedStderr;
+            }
+        }
+
         if (! isset($payload['stdout']) || ! is_array($payload['stdout'])) {
             if ($this->looksLikeToolPayload($payload)) {
                 $payload = ['stdout' => $payload] + $payload;
             } else {
-                foreach (['payload', 'data', 'result', 'body'] as $key) {
+                foreach (['payload', 'data', 'result', 'body', 'partial_results', 'stderr'] as $key) {
                     if (isset($payload[$key]) && is_array($payload[$key]) && $this->looksLikeToolPayload($payload[$key])) {
                         $payload['stdout'] = $payload[$key];
                         break;
@@ -916,15 +978,7 @@ class ScanService
 
     protected function parseCheckov(array $context): Collection
     {
-        $stdout = $context['payload']['stdout'] ?? [];
-
-        if (is_string($stdout) && filled(trim($stdout))) {
-            $decodedStdout = $this->decodeToolPayloadString($stdout);
-
-            if (is_array($decodedStdout)) {
-                $stdout = $decodedStdout;
-            }
-        }
+        $stdout = $this->resolveCheckovStdoutPayload($context['payload']);
 
         if (is_string($stdout) && filled(trim($stdout))) {
             return collect([
@@ -954,7 +1008,7 @@ class ScanService
             'skipped_checks' => 'WARN',
         ];
 
-        return collect($groups)
+        $findings = collect($groups)
             ->flatMap(function (string $bucket, string $group) use ($context, $results): array {
                 return collect($results[$group] ?? [])
                     ->map(function (array $check) use ($context, $bucket, $group): array {
@@ -988,6 +1042,160 @@ class ScanService
                     ->all();
             })
             ->values();
+
+        if ($findings->isNotEmpty()) {
+            return $findings;
+        }
+
+        if (($context['payload']['success'] ?? null) === false || (int) ($context['payload']['return_code'] ?? 0) !== 0) {
+            $rawExecutionOutput = $this->resolveCheckovExecutionOutput($context['payload']);
+
+            if (filled($rawExecutionOutput)) {
+                return collect([
+                    $this->makeFinding(
+                        context: $context,
+                        statusBucket: 'FAIL',
+                        description: $this->summarizeCheckovExecutionOutput($rawExecutionOutput),
+                        recommendation: $this->buildCheckovExecutionRecommendation($rawExecutionOutput),
+                        object: $context['cluster_name'] ?: 'Checkov scan execution',
+                        metadata: [
+                            'tool' => 'checkov',
+                            'status' => 'EXECUTION_ERROR',
+                            'section' => 'execution',
+                            'resource' => $context['cluster_name'] ?: 'Checkov scan execution',
+                            'object' => $context['cluster_name'] ?: 'Checkov scan execution',
+                            'raw_output_excerpt' => Str::limit(preg_replace('/\s+/', ' ', $rawExecutionOutput), 1000),
+                        ],
+                        suggestion: 'Fix the Checkov scanner execution issue, rerun the scan, and review the findings again.',
+                    ),
+                ]);
+            }
+        }
+
+        return $findings;
+    }
+
+    protected function resolveCheckovStdoutPayload(array $payload): array|string
+    {
+        $candidates = [
+            $payload['stdout'] ?? null,
+            $payload['partial_results'] ?? null,
+            $payload['stderr'] ?? null,
+        ];
+
+        foreach ($candidates as $candidate) {
+            if (is_array($candidate) && isset($candidate['results'])) {
+                return $candidate;
+            }
+
+            if (! is_string($candidate) || blank(trim($candidate))) {
+                continue;
+            }
+
+            $decodedCandidate = $this->decodeCheckovPayloadString($candidate);
+
+            if (is_array($decodedCandidate)) {
+                return $decodedCandidate;
+            }
+        }
+
+        $embeddedPayload = $this->findEmbeddedCheckovPayloadInValue($payload);
+
+        if (is_array($embeddedPayload)) {
+            return $embeddedPayload;
+        }
+
+        foreach ($candidates as $candidate) {
+            if (is_string($candidate) && filled(trim($candidate))) {
+                return $candidate;
+            }
+        }
+
+        return [];
+    }
+
+    protected function extractEmbeddedCheckovPayload(string $stdout): ?array
+    {
+        $markers = [
+            '{"check_type":',
+            "{\n    \"check_type\":",
+            "{\r\n    \"check_type\":",
+        ];
+
+        $start = null;
+
+        foreach ($markers as $marker) {
+            $position = strpos($stdout, $marker);
+
+            if ($position !== false) {
+                $start = $position;
+                break;
+            }
+        }
+
+        if ($start === null) {
+            return null;
+        }
+
+        $candidate = substr($stdout, $start);
+        $decoded = json_decode($candidate, true);
+
+        if (is_array($decoded) && isset($decoded['results'])) {
+            return $decoded;
+        }
+
+        return null;
+    }
+
+    protected function decodeCheckovPayloadString(string $payload): ?array
+    {
+        $decoded = $this->decodeToolPayloadString($payload);
+
+        if (is_array($decoded) && isset($decoded['results'])) {
+            return $decoded;
+        }
+
+        $embeddedPayload = $this->extractEmbeddedCheckovPayload($payload);
+
+        if (is_array($embeddedPayload) && isset($embeddedPayload['results'])) {
+            return $embeddedPayload;
+        }
+
+        return null;
+    }
+
+    protected function findEmbeddedCheckovPayloadInValue(mixed $value): ?array
+    {
+        if (is_string($value) && filled(trim($value))) {
+            return $this->decodeCheckovPayloadString($value);
+        }
+
+        if (! is_array($value)) {
+            return null;
+        }
+
+        foreach ($value as $nestedValue) {
+            $embeddedPayload = $this->findEmbeddedCheckovPayloadInValue($nestedValue);
+
+            if (is_array($embeddedPayload)) {
+                return $embeddedPayload;
+            }
+        }
+
+        return null;
+    }
+
+    protected function resolveCheckovExecutionOutput(array $payload): string
+    {
+        foreach (['stdout', 'stderr', 'partial_results'] as $key) {
+            $value = $payload[$key] ?? null;
+
+            if (is_string($value) && filled(trim($value))) {
+                return $value;
+            }
+        }
+
+        return '';
     }
 
     protected function decodeToolPayloadString(string $payload): ?array
@@ -1267,11 +1475,13 @@ class ScanService
     protected function detectToolFromPayload(array $payload): ?string
     {
         $stdout = $payload['stdout'] ?? [];
+        $partialResults = $payload['partial_results'] ?? null;
 
         return match (true) {
             isset($stdout['Controls']) || isset($stdout['controls']) => 'kubebench',
             isset($stdout['summaryDetails'], $stdout['results']) => 'kubescape',
-            isset($stdout['summary'], $stdout['results']) && isset($stdout['check_type']) => 'checkov',
+            (isset($stdout['summary'], $stdout['results']) && isset($stdout['check_type'])) ||
+            (is_array($partialResults) && isset($partialResults['results'], $partialResults['check_type'])) => 'checkov',
             isset($stdout['nmaprun']) || isset($stdout['host']) || collect($stdout)->contains(fn ($entry): bool => is_array($entry) && (isset($entry['nmaprun']) || isset($entry['host']) || isset($entry['ports']))) => 'nmap',
             isset($stdout['Findings'], $stdout['Stats']) => 'rbac-tool',
             default => null,

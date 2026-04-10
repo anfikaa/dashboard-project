@@ -6,8 +6,10 @@ use App\Enums\SecurityTaskStatus;
 use App\Filament\Resources\SecurityTaskResource\Pages;
 use App\Models\ClusterAgent;
 use App\Models\SecurityTask;
+use App\Services\SecurityTaskSyncService;
 use App\Services\TaskExecutionService;
 use Filament\Actions\Action;
+use Filament\Actions\DeleteAction;
 use Filament\Forms\Components\Select;
 use Filament\Forms\Components\Textarea;
 use Filament\Forms\Components\TextInput;
@@ -56,6 +58,20 @@ class SecurityTaskResource extends Resource
                     }
 
                     $agentTools = collect($agent->available_tools)
+                        ->map(function (mixed $tool): ?string {
+                            if (! is_scalar($tool)) {
+                                return null;
+                            }
+
+                            return match (strtolower(str_replace('_', '-', trim((string) $tool)))) {
+                                'kube-bench', 'kubebench' => 'kubebench',
+                                'kubescape', 'kube-escape' => 'kubescape',
+                                'rbac-tool', 'rbac_tool', 'rbac' => 'rbac-tool',
+                                'nmap', 'n-map' => 'nmap',
+                                'checkov', 'check-ov' => 'checkov',
+                                default => strtolower(str_replace('_', '-', trim((string) $tool))),
+                            };
+                        })
                         ->filter(fn (string $tool): bool => array_key_exists($tool, $supportedTools))
                         ->mapWithKeys(fn (string $tool): array => [$tool => $supportedTools[$tool]])
                         ->all();
@@ -121,18 +137,29 @@ class SecurityTaskResource extends Resource
                     ->options(fn (): array => ClusterAgent::query()->orderBy('name')->pluck('name', 'id')->all()),
             ])
             ->actions([
+                Action::make('refresh')
+                    ->label('Refresh Status')
+                    ->icon('heroicon-o-arrow-path')
+                    ->color('gray')
+                    ->action(fn (SecurityTask $record) => app(SecurityTaskSyncService::class)->syncTask($record))
+                    ->successNotificationTitle('Remote task status refreshed.'),
                 Action::make('run')
-                    ->label('Run Task')
+                    ->label('Dispatch Task')
                     ->icon('heroicon-o-play')
                     ->color('warning')
                     ->requiresConfirmation()
                     ->action(fn (SecurityTask $record) => app(TaskExecutionService::class)->run($record))
-                    ->successNotificationTitle('Task execution finished.'),
+                    ->successNotificationTitle('Task dispatch request sent.'),
                 Action::make('results')
                     ->label('See Findings')
                     ->icon('heroicon-o-eye')
                     ->color('primary')
                     ->url(fn (SecurityTask $record): string => SecurityTaskResultResource::getUrl('index') . '?task=' . urlencode($record->task_id)),
+                DeleteAction::make()
+                    ->label('Delete Task')
+                    ->icon('heroicon-o-trash')
+                    ->requiresConfirmation()
+                    ->successNotificationTitle('Task deleted.'),
             ]);
     }
 
