@@ -396,16 +396,6 @@ class ScanService
             $clientConfig['endpoint'] = $config['endpoint'];
         }
 
-        if (filled($config['key'] ?? null) && filled($config['secret'] ?? null)) {
-            $clientConfig['credentials'] = array_filter([
-                'key' => $config['key'],
-                'secret' => $config['secret'],
-                'token' => $config['token'] ?? null,
-            ]);
-        } elseif (filled($config['profile'] ?? null)) {
-            $clientConfig['profile'] = $config['profile'];
-        }
-
         return new S3Client($clientConfig);
     }
 

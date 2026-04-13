@@ -427,16 +427,6 @@ class SecurityTaskSyncService
             $config['endpoint'] = env('AWS_DYNAMODB_ENDPOINT');
         }
 
-        if (filled(env('AWS_ACCESS_KEY_ID')) && filled(env('AWS_SECRET_ACCESS_KEY'))) {
-            $config['credentials'] = array_filter([
-                'key' => env('AWS_ACCESS_KEY_ID'),
-                'secret' => env('AWS_SECRET_ACCESS_KEY'),
-                'token' => env('AWS_SESSION_TOKEN'),
-            ]);
-        } elseif (filled(env('AWS_PROFILE'))) {
-            $config['profile'] = env('AWS_PROFILE');
-        }
-
         return new DynamoDbClient($config);
     }
 
