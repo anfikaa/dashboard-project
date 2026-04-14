@@ -23,7 +23,7 @@ class TopFindings extends TableWidget
     {
         return $table
             ->heading('Top Findings')
-            ->description('Search across failed findings parsed directly from the configured scan source.')
+            ->description('Search across failed findings imported from task results and fallback scan parsing.')
             ->searchable()
             ->searchPlaceholder('Search scan id, tool, cluster, status, finding, remediation...')
             ->defaultSort('scanned_at', 'desc')

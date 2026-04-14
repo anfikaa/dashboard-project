@@ -36,16 +36,22 @@ class SecurityTaskResource extends Resource
                 ->required()
                 ->maxLength(255),
             Select::make('cluster_agent_id')
-                ->label('Cluster Agent')
+                ->label('Clusters')
                 ->options(fn (): array => ClusterAgent::query()
                     ->active()
                     ->orderBy('name')
-                    ->pluck('name', 'id')
+                    ->get()
+                    ->mapWithKeys(fn (ClusterAgent $agent): array => [
+                        $agent->id => filled($agent->label)
+                            ? $agent->cluster_name . ' (' . $agent->label . ')'
+                            : $agent->cluster_name,
+                    ])
                     ->all())
                 ->searchable()
                 ->preload()
                 ->live()
-                ->required(),
+                ->required()
+                ->helperText('The selected cluster value will be sent to the agent API as the `clusters` field.'),
             Select::make('tools')
                 ->label('Security Tools')
                 ->multiple()
@@ -92,6 +98,7 @@ class SecurityTaskResource extends Resource
     {
         return $table
             ->defaultSort('created_at', 'desc')
+            ->poll('10s')
             ->columns([
                 Tables\Columns\TextColumn::make('task_id')
                     ->label('Task ID')
@@ -101,7 +108,8 @@ class SecurityTaskResource extends Resource
                     ->searchable()
                     ->wrap(),
                 Tables\Columns\TextColumn::make('clusterAgent.name')
-                    ->label('Agent')
+                    ->label('Cluster')
+                    ->state(fn (SecurityTask $record): string => $record->clusterAgent?->cluster_name ?? $record->clusterAgent?->name ?? '-')
                     ->searchable()
                     ->sortable(),
                 Tables\Columns\TextColumn::make('tools')
@@ -127,21 +135,33 @@ class SecurityTaskResource extends Resource
                 Tables\Columns\TextColumn::make('created_at')
                     ->label('Submitted At')
                     ->dateTime('d M Y H:i')
+                    ->timezone('Asia/Jakarta')
                     ->sortable(),
             ])
             ->filters([
                 Tables\Filters\SelectFilter::make('status')
                     ->options(SecurityTaskStatus::options()),
                 Tables\Filters\SelectFilter::make('cluster_agent_id')
-                    ->label('Cluster Agent')
-                    ->options(fn (): array => ClusterAgent::query()->orderBy('name')->pluck('name', 'id')->all()),
+                    ->label('Clusters')
+                    ->options(fn (): array => ClusterAgent::query()
+                        ->orderBy('cluster_name')
+                        ->get()
+                        ->mapWithKeys(fn (ClusterAgent $agent): array => [
+                            $agent->id => filled($agent->label)
+                                ? $agent->cluster_name . ' (' . $agent->label . ')'
+                                : $agent->cluster_name,
+                        ])
+                        ->all()),
             ])
             ->actions([
                 Action::make('refresh')
                     ->label('Refresh Status')
                     ->icon('heroicon-o-arrow-path')
                     ->color('gray')
-                    ->action(fn (SecurityTask $record) => app(SecurityTaskSyncService::class)->syncTask($record))
+                    ->action(function (SecurityTask $record): void {
+                        app(SecurityTaskSyncService::class)->syncTask($record);
+                        $record->refresh();
+                    })
                     ->successNotificationTitle('Remote task status refreshed.'),
                 Action::make('run')
                     ->label('Dispatch Task')

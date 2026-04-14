@@ -10,9 +10,9 @@ use Illuminate\Support\Str;
 
 class DynamoDbClusterAgentService
 {
-    public function syncToDatabase(): int
+    public function syncToDatabase(bool $forceRefresh = false): int
     {
-        $agents = $this->getAgents();
+        $agents = $this->getAgents($forceRefresh);
         $activeKeys = [];
 
         foreach ($agents as $agent) {
@@ -49,13 +49,14 @@ class DynamoDbClusterAgentService
         return count($agents);
     }
 
-    public function getAgents(): array
+    public function getAgents(bool $forceRefresh = false): array
     {
         $ttl = max(1, (int) env('CLUSTER_AGENT_CACHE_TTL_SECONDS', 60));
-        $cacheKey = 'cluster-agents.dynamodb.' . md5(json_encode([
-            'table' => $this->tableName(),
-            'region' => env('AWS_DYNAMODB_REGION'),
-        ]));
+        $cacheKey = $this->cacheKey();
+
+        if ($forceRefresh) {
+            Cache::forget($cacheKey);
+        }
 
         return Cache::remember($cacheKey, now()->addSeconds($ttl), function (): array {
             $client = $this->makeClient();
@@ -93,6 +94,14 @@ class DynamoDbClusterAgentService
                 ->values()
                 ->all();
         });
+    }
+
+    protected function cacheKey(): string
+    {
+        return 'cluster-agents.dynamodb.' . md5(json_encode([
+            'table' => $this->tableName(),
+            'region' => env('AWS_DYNAMODB_REGION'),
+        ]));
     }
 
     protected function normalizeAgentRecord(array $record): ?array

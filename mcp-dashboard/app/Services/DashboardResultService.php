@@ -2,14 +2,18 @@
 
 namespace App\Services;
 
+use App\Models\SecurityTaskResult;
 use Illuminate\Support\Carbon;
-use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Str;
+use Throwable;
 
 class DashboardResultService
 {
-    protected const CACHE_VERSION = '2026-04-07-findings-scalar-v1';
+    protected const CACHE_VERSION = '2026-04-14-dashboard-db-v3';
+
+    protected ?Collection $requestFindingsCache = null;
 
     public function __construct(
         protected ScanService $scanService,
@@ -95,34 +99,97 @@ class DashboardResultService
 
     protected function allFindings(): Collection
     {
-        $tools = array_keys(TaskExecutionService::getAvailableTools());
+        if ($this->requestFindingsCache instanceof Collection) {
+            return $this->requestFindingsCache;
+        }
+
         $ttl = max(1, (int) env('SCAN_CACHE_TTL_SECONDS', 300));
-        $cacheKey = 'dashboard.scan-findings.' . md5(json_encode([
+        $cacheKey = 'dashboard.findings.' . md5(json_encode([
             'version' => self::CACHE_VERSION,
-            'source' => env('SCAN_SOURCE', 'local'),
+            'results_updated_at' => SecurityTaskResult::query()->max('updated_at'),
+            'scan_source' => env('SCAN_SOURCE', 'local'),
             'disk' => env('SCAN_S3_DISK', 's3'),
             'prefix' => env('SCAN_S3_PREFIX', 'result'),
-            'tools' => $tools,
-            'max_files' => env('SCAN_S3_MAX_FILES', 200),
         ]));
-        $cached = Cache::get($cacheKey);
 
-        if (is_array($cached) && $cached !== []) {
-            return collect($cached)->map(fn (array $finding): array => $this->hydrateFinding($finding))->values();
-        }
+        $items = Cache::remember($cacheKey, now()->addSeconds($ttl), function (): array {
+            $preferS3 = env('SCAN_SOURCE', 'local') === 's3';
 
-        $fresh = $this->scanService->getNormalizedFindingsForTools($tools)->values();
-        $serialized = $fresh
-            ->map(fn (array $finding): array => $this->serializeFinding($finding))
+            if (! $preferS3) {
+                $databaseFindings = $this->loadFindingsFromDatabase();
+
+                if ($databaseFindings->isNotEmpty()) {
+                    return $databaseFindings
+                        ->map(fn (array $finding): array => $this->serializeFinding($finding))
+                        ->values()
+                        ->all();
+                }
+            }
+
+            try {
+                $s3Findings = $this->scanService
+                    ->getNormalizedFindingsForTools(array_keys(TaskExecutionService::getAvailableTools()))
+                    ->map(fn (array $finding): array => $this->serializeFinding($finding))
+                    ->values();
+
+                if ($s3Findings->isNotEmpty()) {
+                    return $s3Findings->all();
+                }
+            } catch (Throwable) {
+                // Fall back to database below.
+            }
+
+            $databaseFindings = $this->loadFindingsFromDatabase();
+
+            if ($databaseFindings->isNotEmpty()) {
+                return $databaseFindings
+                    ->map(fn (array $finding): array => $this->serializeFinding($finding))
+                    ->values()
+                    ->all();
+            }
+
+            return [];
+        });
+
+        return $this->requestFindingsCache = collect($items)
+            ->map(fn (array $finding): array => $this->hydrateFinding($finding))
             ->values();
+    }
 
-        if ($fresh->isNotEmpty()) {
-            Cache::put($cacheKey, $serialized->all(), now()->addSeconds($ttl));
-        } elseif (! is_array($cached)) {
-            Cache::put($cacheKey, [], now()->addSeconds(min($ttl, 60)));
-        }
+    protected function loadFindingsFromDatabase(): Collection
+    {
+        return SecurityTaskResult::query()
+            ->latest('scanned_at')
+            ->get()
+            ->map(fn (SecurityTaskResult $result): array => $this->mapDatabaseFinding($result))
+            ->values();
+    }
 
-        return $serialized->map(fn (array $finding): array => $this->hydrateFinding($finding))->values();
+    protected function mapDatabaseFinding(SecurityTaskResult $result): array
+    {
+        $metadata = is_array($result->metadata) ? $result->metadata : [];
+        $bucket = Str::upper((string) ($metadata['status_bucket'] ?? $result->severity ?? 'WARN'));
+        $scanStatus = $metadata['scan_status']
+            ?? (Str::contains(Str::lower((string) $result->scan_finding), 'execution failed') ? 'FAILED' : 'COMPLETED');
+
+        return [
+            'tool' => (string) ($result->source_tool ?? $metadata['tool'] ?? 'unknown'),
+            'scan_id' => (string) ($result->task_identifier ?? $metadata['scan_id'] ?? 'unknown-task'),
+            'scan_status' => Str::upper((string) $scanStatus),
+            'cluster_name' => (string) ($result->cluster_name ?? $metadata['cluster_name'] ?? 'Unknown cluster'),
+            'scanned_at' => $this->normalizeScannedAt($result->scanned_at),
+            'status_bucket' => $bucket,
+            'description' => (string) ($result->scan_finding ?? 'Finding generated from imported scan result.'),
+            'recommendation' => (string) ($result->recommendation ?? 'Review the reported issue and apply the recommended control.'),
+            'suggestion' => (string) ($result->suggestion ?? 'Review this finding with the security team and remediate as needed.'),
+            'object' => (string) ($metadata['object'] ?? $metadata['resource'] ?? $metadata['name'] ?? $result->cluster_name ?? 'Finding context'),
+            'metadata' => array_merge($metadata, [
+                'scan_id' => $metadata['scan_id'] ?? $result->task_identifier,
+                'scan_status' => Str::upper((string) $scanStatus),
+                'cluster_name' => $metadata['cluster_name'] ?? $result->cluster_name,
+                'object' => $metadata['object'] ?? $metadata['resource'] ?? $metadata['name'] ?? $result->cluster_name,
+            ]),
+        ];
     }
 
     protected function transformFinding(array $finding): array
@@ -205,7 +272,7 @@ class DashboardResultService
             return $value;
         }
 
-        if (is_string($value) && filled($value)) {
+        if (filled($value)) {
             return Carbon::parse($value);
         }
 

@@ -23,7 +23,7 @@ class Dashboard extends BaseDashboard
 
     public function getSubheading(): string | Htmlable | null
     {
-        return 'Overview of security findings parsed directly from the configured scan source.';
+        return null;
     }
 
     protected function getHeaderWidgets(): array
@@ -53,22 +53,31 @@ class Dashboard extends BaseDashboard
         return $schema->components([
             Select::make('task_identifier')
                 ->label('Scan ID')
-                ->options(fn (): array => app(DashboardResultService::class)->getDashboardOptions('scan_id'))
+                ->options(fn (): array => $this->safeDashboardOptions('scan_id'))
                 ->searchable()
                 ->preload()
                 ->placeholder('All scans'),
             Select::make('source_tool')
                 ->label('Tool')
-                ->options(fn (): array => app(DashboardResultService::class)->getDashboardOptions('tool'))
+                ->options(fn (): array => $this->safeDashboardOptions('tool'))
                 ->searchable()
                 ->preload()
                 ->placeholder('All tools'),
             Select::make('cluster_name')
                 ->label('Cluster')
-                ->options(fn (): array => app(DashboardResultService::class)->getDashboardOptions('cluster_name'))
+                ->options(fn (): array => $this->safeDashboardOptions('cluster_name'))
                 ->searchable()
                 ->preload()
                 ->placeholder('All clusters'),
         ]);
+    }
+
+    protected function safeDashboardOptions(string $field): array
+    {
+        try {
+            return app(DashboardResultService::class)->getDashboardOptions($field);
+        } catch (\Throwable) {
+            return [];
+        }
     }
 }

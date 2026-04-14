@@ -31,6 +31,10 @@ class TaskExecutionService
 
     public function run(SecurityTask $task): void
     {
+        // Prevent "Maximum execution time of 30 seconds exceeded" error
+        // caused by multiple consecutive HTTP requests.
+        set_time_limit(0);
+
         $task->loadMissing('clusterAgent');
 
         $agent = $task->clusterAgent;
@@ -76,14 +80,23 @@ class TaskExecutionService
             ]);
 
             $baseUrl = $this->resolveAgentBaseUrl($agent);
-            $health = $this->assertAgentHealth($baseUrl, $agent);
+            try {
+                $health = $this->assertAgentHealth($baseUrl, $agent);
+            } catch (\Throwable $e) {
+                $health = ['status' => 'unhealthy', 'error' => $e->getMessage()];
+                $this->logWarning('Health check failed — proceeding with dispatch anyway.', [
+                    'task_id' => $task->task_id,
+                    'cluster_name' => $agent->cluster_name,
+                    'error' => $e->getMessage(),
+                ]);
+            }
             $dispatched = [];
             $failures = [];
             $now = now()->utc()->toIso8601String();
 
             foreach ($selectedTools as $tool) {
                 $remoteTaskId = (string) Str::uuid();
-                $parameters = $this->buildParameters($tool);
+                $parameters = $this->filterOptionalParameters($this->buildParameters($tool));
 
                 $this->logInfo('Preparing remote dispatch record.', [
                     'task_id' => $task->task_id,
@@ -147,7 +160,7 @@ class TaskExecutionService
                         'cluster_sort_key' => $this->makeClusterSortKey($agent),
                         'health_status' => data_get($health, 'status'),
                         'agent_response_code' => $response->status(),
-                        'agent_response' => $response->json() ?? ['body' => $response->body()],
+                        'agent_response' => $this->summarizeAgentResponse($response->json(), $response->body()),
                         'result_prefix' => $this->makeResultPrefix($remoteTaskId, $agent),
                     ];
 
@@ -157,6 +170,49 @@ class TaskExecutionService
                         'remote_task_id' => $remoteTaskId,
                         'response_code' => $response->status(),
                         'result_prefix' => $this->makeResultPrefix($remoteTaskId, $agent),
+                    ]);
+                } catch (\Illuminate\Http\Client\ConnectionException $connEx) {
+                    // Timeout/connection error: agent may have already accepted the task.
+                    // Mark as RUNNING so the sync service can still pick up results from S3/DynamoDB.
+                    $updatedAt = now()->utc()->toIso8601String();
+
+                    $this->putMetaItem(
+                        remoteTaskId: $remoteTaskId,
+                        tool: $tool,
+                        status: 'RUNNING',
+                        createdAt: $now,
+                        updatedAt: $updatedAt,
+                    );
+
+                    $this->putClusterItem(
+                        remoteTaskId: $remoteTaskId,
+                        agent: $agent,
+                        tool: $tool,
+                        parameters: $parameters,
+                        status: 'RUNNING',
+                        createdAt: $now,
+                        updatedAt: $updatedAt,
+                    );
+
+                    // Still add to dispatched so sync service monitors it
+                    $dispatched[] = [
+                        'tool' => $tool,
+                        'tool_label' => self::getAvailableTools()[$tool] ?? $tool,
+                        'remote_task_id' => $remoteTaskId,
+                        'cluster_name' => $agent->cluster_name,
+                        'cluster_sort_key' => $this->makeClusterSortKey($agent),
+                        'health_status' => data_get($health, 'status'),
+                        'agent_response_code' => null,
+                        'agent_response' => ['note' => 'Dispatch timed out; agent may still be processing.'],
+                        'result_prefix' => $this->makeResultPrefix($remoteTaskId, $agent),
+                        'dispatch_timed_out' => true,
+                    ];
+
+                    $this->logWarning('Dispatch HTTP timed out — treating as RUNNING so sync can monitor S3 for results.', [
+                        'task_id' => $task->task_id,
+                        'tool' => $tool,
+                        'remote_task_id' => $remoteTaskId,
+                        'error' => $connEx->getMessage(),
                     ]);
                 } catch (Throwable $exception) {
                     $updatedAt = now()->utc()->toIso8601String();
@@ -245,21 +301,51 @@ class TaskExecutionService
 
     protected function assertAgentHealth(string $baseUrl, ClusterAgent $agent): array
     {
+        $cacheKey = 'agent_health_' . md5($baseUrl . $agent->cluster_name);
+        $cacheTtl = now()->endOfDay()->diffInSeconds(now()); // until midnight
+
+        $cached = \Illuminate\Support\Facades\Cache::get($cacheKey);
+        if ($cached !== null) {
+            $this->logInfo('Cluster health check served from cache.', [
+                'cluster_name' => $agent->cluster_name,
+                'cached_status' => $cached['status'] ?? 'unknown',
+            ]);
+
+            return $cached;
+        }
+
+        $healthUrl = $baseUrl . '/health/' . rawurlencode((string) $agent->cluster_name);
+
         $this->logInfo('Calling cluster health endpoint.', [
             'cluster_name' => $agent->cluster_name,
             'base_url' => $baseUrl,
-            'url' => $baseUrl . '/health/' . rawurlencode((string) $agent->cluster_name),
+            'url' => $healthUrl,
         ]);
 
-        $response = Http::timeout($this->httpTimeout())
-            ->connectTimeout($this->httpConnectTimeout())
-            ->acceptJson()
-            ->get($baseUrl . '/health/' . rawurlencode((string) $agent->cluster_name));
+        $startedAt = microtime(true);
+
+        try {
+            $response = Http::retry(1, 500, throw: false)
+                ->timeout($this->healthCheckTimeout())
+                ->connectTimeout($this->healthCheckConnectTimeout())
+                ->acceptJson()
+                ->get($healthUrl);
+        } catch (\Illuminate\Http\Client\ConnectionException $e) {
+            $this->logWarning('Health check timed out or could not connect.', [
+                'cluster_name' => $agent->cluster_name,
+                'url' => $healthUrl,
+                'error' => $e->getMessage(),
+            ]);
+            throw $e;
+        }
+
+        $durationMs = (int) round((microtime(true) - $startedAt) * 1000);
 
         if (! $response->successful()) {
             $this->logWarning('Cluster health check returned a non-success response.', [
                 'cluster_name' => $agent->cluster_name,
                 'status_code' => $response->status(),
+                'duration_ms' => $durationMs,
                 'body' => Str::limit($response->body(), 500),
             ]);
 
@@ -273,6 +359,7 @@ class TaskExecutionService
         $this->logInfo('Cluster health check succeeded.', [
             'cluster_name' => $agent->cluster_name,
             'status_code' => $response->status(),
+            'duration_ms' => $durationMs,
             'body' => $response->json() ?? ['body' => Str::limit($response->body(), 500)],
         ]);
 
@@ -288,21 +375,12 @@ class TaskExecutionService
         array $parameters,
     ): Response {
         $endpoint = $this->resolveToolEndpoint($tool);
-        $payload = [
-            'task_id' => $remoteTaskId,
-            'request_id' => $remoteTaskId,
-            'cluster' => $agent->cluster_name,
-            'cluster_name' => $agent->cluster_name,
-            'tool' => $tool,
-            'title' => $task->title,
-            'notes' => $task->notes,
-            'submitted_by' => $task->submitted_by,
-            'parameters' => $parameters,
-            'result' => [
-                'bucket' => (string) config('filesystems.disks.' . env('SCAN_S3_DISK', 's3') . '.bucket'),
-                'prefix' => $this->makeResultPrefix($remoteTaskId, $agent),
-            ],
-        ];
+
+        // Keep the agent request body strict: only clusters is mandatory, all other
+        // fields are optional and sent only when they have a meaningful value.
+        $payload = array_merge([
+            'clusters' => [(string) $agent->cluster_name],
+        ], $parameters);
 
         $response = Http::timeout($this->httpTimeout())
             ->connectTimeout($this->httpConnectTimeout())
@@ -319,6 +397,16 @@ class TaskExecutionService
                 'body' => Str::limit($response->body(), 1000),
             ]);
 
+            // HTTP 5xx = server-side transient error: treat like a timeout so DynamoDB stays RUNNING
+            if ($response->serverError()) {
+                throw new \Illuminate\Http\Client\ConnectionException(sprintf(
+                    'Agent returned server error HTTP %d for %s — treating as transient.',
+                    $response->status(),
+                    self::getAvailableTools()[$tool] ?? $tool,
+                ));
+            }
+
+            // HTTP 4xx = client error (bad request): permanent failure
             throw new RuntimeException(sprintf(
                 'Agent rejected %s dispatch with HTTP %d.',
                 self::getAvailableTools()[$tool] ?? $tool,
@@ -336,25 +424,145 @@ class TaskExecutionService
     protected function resolveToolEndpoint(string $tool): string
     {
         return match ($tool) {
-            'checkov' => '/api/tools/scan/checkov',
+            'checkov'   => '/api/tools/scan/checkov',
             'kubebench' => '/api/tools/audit/kube-bench',
             'kubescape' => '/api/tools/audit/kubescape',
-            'nmap' => '/api/tools/scan/nmap',
+            'nmap'      => '/api/tools/scan/nmap',
             'rbac-tool' => '/api/tools/audit/rbac-tool',
-            default => throw new RuntimeException(sprintf('No agent endpoint is configured for tool [%s].', $tool)),
+            default     => throw new RuntimeException(sprintf('No agent endpoint is configured for tool [%s].', $tool)),
         };
     }
 
+    // protected function buildParameters(string $tool): array
+    // {
+    //     return [
+    //         'directory' => '',
+    //         'framework' => $tool === 'nmap' ? '' : 'kubernetes',
+    //         'check' => '',
+    //         'skip_check' => '',
+    //         'output_format' => 'json',
+    //         'additional_args' => '',
+    //     ];
+    // }
+
     protected function buildParameters(string $tool): array
     {
-        return [
-            'directory' => '',
-            'framework' => $tool === 'nmap' ? '' : 'kubernetes',
-            'check' => '',
-            'skip_check' => '',
-            'output_format' => 'json',
-            'additional_args' => '',
-        ];
+        return match ($tool) {
+
+            /**
+             * Checkov
+             * POST /api/tools/scan/checkov
+             * Required: clusters (injected by dispatchTool)
+             */
+            'checkov' => [
+                'directory'      => '',
+                'framework'      => 'kubernetes',
+                'check'          => '',
+                'skip_check'     => '',
+                'output_format'  => 'json',
+                'additional_args'=> '',
+            ],
+
+            /**
+             * Nmap
+             * POST /api/tools/scan/nmap
+             * Required: clusters (injected by dispatchTool)
+             */
+            'nmap' => [
+                'scan_type'      => '-p-',
+                'ports'          => '',
+                'additional_args'=> '',
+            ],
+
+            /**
+             * Kube-bench
+             * POST /api/tools/audit/kube-bench
+             * Required: clusters (injected by dispatchTool)
+             */
+            'kubebench' => [
+                'config_dir'     => '',
+                'target'         => 'node',
+                'output_format'  => 'json',
+                'additional_args'=> '',
+            ],
+
+            /**
+             * Kubescape
+             * POST /api/tools/audit/kubescape
+             * Required: clusters (injected by dispatchTool)
+             */
+            'kubescape' => [
+                'scan_type'      => 'framework',
+                'target'         => 'nsa',
+                'namespace'      => '',
+                'output_format'  => 'json',
+                'additional_args'=> '',
+            ],
+
+            /**
+             * RBAC Tool
+             * POST /api/tools/audit/rbac-tool
+             * Required: clusters (injected by dispatchTool)
+             */
+            'rbac-tool' => [
+                'instruction'    => 'analysis',
+                'output_format'  => 'json',
+                'additional_args'=> '',
+            ],
+
+            default => [],
+        };
+    }
+
+    protected function filterOptionalParameters(array $parameters): array
+    {
+        return collect($parameters)
+            ->reject(function (mixed $value): bool {
+                if ($value === null) {
+                    return true;
+                }
+
+                if (is_string($value)) {
+                    return trim($value) === '';
+                }
+
+                if (is_array($value)) {
+                    return $value === [];
+                }
+
+                return false;
+            })
+            ->all();
+    }
+
+    protected function summarizeAgentResponse(mixed $json, string $body): array
+    {
+        $payload = is_array($json) ? $json : ['body' => Str::limit($body, 1000)];
+
+        return collect($payload)
+            ->map(function (mixed $entry): mixed {
+                if (! is_array($entry)) {
+                    return $entry;
+                }
+
+                $result = $entry['result'] ?? null;
+
+                if (! is_array($result)) {
+                    return $entry;
+                }
+
+                $stdout = $result['stdout'] ?? null;
+
+                return array_merge($entry, [
+                    'result' => array_merge($result, [
+                        'stdout' => is_string($stdout) ? Str::limit($stdout, 2000) : $stdout,
+                        'stdout_truncated' => is_string($stdout) && strlen($stdout) > 2000,
+                        'stdout_size' => is_string($stdout) ? strlen($stdout) : null,
+                    ]),
+                ]);
+            })
+            ->values()
+            ->all();
     }
 
     protected function putMetaItem(
@@ -400,24 +608,60 @@ class TaskExecutionService
         ]);
     }
 
+    // protected function putItem(array $item): void
+    // {
+    //     $client = $this->makeDynamoDbClient();
+    //     $marshaler = new Marshaler();
+
+    //     $this->logInfo('Writing task metadata item to DynamoDB.', [
+    //         'table' => $this->dynamoTableName(),
+    //         'pk' => $item['pk'] ?? null,
+    //         'sk' => $item['sk'] ?? null,
+    //         'status' => $item['status'] ?? null,
+    //         'tool' => $item['tool'] ?? null,
+    //     ]);
+
+    //     $client->putItem([
+    //         'TableName' => $this->dynamoTableName(),
+    //         'Item' => $marshaler->marshalItem($item),
+    //     ]);
+    // }
+
     protected function putItem(array $item): void
-    {
-        $client = $this->makeDynamoDbClient();
-        $marshaler = new Marshaler();
+{
+    $client = $this->makeDynamoDbClient();
+    $marshaler = new Marshaler();
 
-        $this->logInfo('Writing task metadata item to DynamoDB.', [
-            'table' => $this->dynamoTableName(),
-            'pk' => $item['pk'] ?? null,
-            'sk' => $item['sk'] ?? null,
-            'status' => $item['status'] ?? null,
-            'tool' => $item['tool'] ?? null,
-        ]);
-
-        $client->putItem([
-            'TableName' => $this->dynamoTableName(),
-            'Item' => $marshaler->marshalItem($item),
-        ]);
+    // ✅ Normalize key (FIX UTAMA)
+    if (isset($item['pk'])) {
+        $item['PK'] = $item['pk'];
+        unset($item['pk']);
     }
+
+    if (isset($item['sk'])) {
+        $item['SK'] = $item['sk'];
+        unset($item['sk']);
+    }
+
+    // ❗ Validasi biar fail fast
+    if (!isset($item['PK']) || !isset($item['SK'])) {
+        throw new \InvalidArgumentException('Missing required DynamoDB keys: PK and/or SK');
+    }
+
+    // 🧪 Log yang benar
+    $this->logInfo('Writing item to DynamoDB.', [
+        'table' => $this->dynamoTableName(),
+        'PK' => $item['PK'],
+        'SK' => $item['SK'],
+        'status' => $item['status'] ?? null,
+        'tool' => $item['tool'] ?? null,
+    ]);
+
+    $client->putItem([
+        'TableName' => $this->dynamoTableName(),
+        'Item' => $marshaler->marshalItem($item),
+    ]);
+}
 
     protected function makeClusterSortKey(ClusterAgent $agent): string
     {
@@ -460,6 +704,16 @@ class TaskExecutionService
     protected function httpConnectTimeout(): int
     {
         return max(2, (int) env('SECURITY_TASK_HTTP_CONNECT_TIMEOUT_SECONDS', 10));
+    }
+
+    protected function healthCheckTimeout(): int
+    {
+        return max(5, (int) env('SECURITY_TASK_HEALTHCHECK_TIMEOUT_SECONDS', 20));
+    }
+
+    protected function healthCheckConnectTimeout(): int
+    {
+        return max(2, (int) env('SECURITY_TASK_HEALTHCHECK_CONNECT_TIMEOUT_SECONDS', 5));
     }
 
     protected function makeDynamoDbClient(): DynamoDbClient

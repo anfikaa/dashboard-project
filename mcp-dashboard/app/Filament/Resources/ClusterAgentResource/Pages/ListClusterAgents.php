@@ -14,6 +14,11 @@ class ListClusterAgents extends ListRecords
     {
         parent::mount();
 
+        app(DynamoDbClusterAgentService::class)->syncToDatabase(true);
+    }
+
+    public function hydrate(): void
+    {
         app(DynamoDbClusterAgentService::class)->syncToDatabase();
     }
 }

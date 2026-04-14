@@ -4,6 +4,8 @@ namespace App\Filament\Resources;
 
 use App\Filament\Resources\ClusterAgentResource\Pages;
 use App\Models\ClusterAgent;
+use App\Services\DynamoDbClusterAgentService;
+use Filament\Actions\Action;
 use Filament\Resources\Resource;
 use Filament\Schemas\Schema;
 use Filament\Tables;
@@ -26,6 +28,14 @@ class ClusterAgentResource extends Resource
     {
         return $table
             ->defaultSort('cluster_name')
+            ->poll('15s')
+            ->headerActions([
+                Action::make('syncAgents')
+                    ->label('Sync Agents')
+                    ->icon('heroicon-o-arrow-path')
+                    ->action(fn (): int => app(DynamoDbClusterAgentService::class)->syncToDatabase(true))
+                    ->successNotificationTitle('Cluster agents synced.'),
+            ])
             ->columns([
                 Tables\Columns\TextColumn::make('cluster_name')
                     ->label('Cluster Agent')
@@ -57,9 +67,11 @@ class ClusterAgentResource extends Resource
                     ->badge()
                     ->separator(',')
                     ->wrap(),
-                Tables\Columns\TextColumn::make('created_at')
+                Tables\Columns\TextColumn::make('last_seen_at')
                     ->label('Synced')
                     ->dateTime('d M Y H:i')
+                    ->timezone('Asia/Jakarta')
+                    ->placeholder('-')
                     ->sortable(),
             ])
             ->filters([]);
