@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Enums\SecurityTaskStatus;
 use App\Models\ClusterAgent;
 use App\Models\SecurityTask;
+use App\Support\AwsCredentialFactory;
 use Aws\DynamoDb\DynamoDbClient;
 use Aws\DynamoDb\Marshaler;
 use Illuminate\Http\Client\Response;
@@ -727,7 +728,7 @@ class TaskExecutionService
             $config['endpoint'] = env('AWS_DYNAMODB_ENDPOINT');
         }
 
-        return new DynamoDbClient($config);
+        return new DynamoDbClient(AwsCredentialFactory::applyToConfig($config));
     }
 
     protected function logInfo(string $message, array $context = []): void

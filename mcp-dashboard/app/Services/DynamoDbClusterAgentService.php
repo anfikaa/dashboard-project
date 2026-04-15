@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\ClusterAgent;
+use App\Support\AwsCredentialFactory;
 use Aws\DynamoDb\DynamoDbClient;
 use Aws\DynamoDb\Marshaler;
 use Illuminate\Support\Facades\Cache;
@@ -211,7 +212,7 @@ class DynamoDbClusterAgentService
             $config['endpoint'] = env('AWS_DYNAMODB_ENDPOINT');
         }
 
-        return new DynamoDbClient($config);
+        return new DynamoDbClient(AwsCredentialFactory::applyToConfig($config));
     }
 
     protected function tableName(): string
