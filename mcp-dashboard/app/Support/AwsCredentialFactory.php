@@ -3,6 +3,7 @@
 namespace App\Support;
 
 use Aws\Credentials\CredentialProvider;
+use Aws\Credentials\EcsCredentialProvider;
 
 class AwsCredentialFactory
 {
@@ -59,7 +60,7 @@ class AwsCredentialFactory
     {
         return [
             'aws_credential_mode' => self::usingInjectedContainerCredentials() ? 'container' : 'default-chain',
-            'aws_credential_provider_method' => self::containerProviderMethod(),
+            'aws_credential_provider_method' => self::usingInjectedContainerCredentials() ? 'EcsCredentialProvider' : 'defaultProvider',
             'aws_container_credentials_uri_present' => self::containerCredentialsUri() !== null,
             'aws_container_authorization_token_present' => self::hasAuthorizationToken(),
             'aws_profile_active' => self::sharedProfile(),
@@ -72,60 +73,7 @@ class AwsCredentialFactory
 
     protected static function makeContainerCredentialProvider(): callable
     {
-        $method = self::containerProviderMethod();
-
-        return match ($method) {
-            'containerCredentials' => CredentialProvider::containerCredentials(self::containerProviderConfig()),
-            'ecsCredentials' => CredentialProvider::ecsCredentials(self::ecsProviderConfig()),
-            default => CredentialProvider::defaultProvider(),
-        };
-    }
-
-    protected static function containerProviderMethod(): string
-    {
-        if (! self::usingInjectedContainerCredentials()) {
-            return 'defaultProvider';
-        }
-
-        if (method_exists(CredentialProvider::class, 'containerCredentials')) {
-            return 'containerCredentials';
-        }
-
-        if (method_exists(CredentialProvider::class, 'ecsCredentials')) {
-            return 'ecsCredentials';
-        }
-
-        return 'defaultProvider';
-    }
-
-    protected static function containerProviderConfig(): array
-    {
-        $config = [];
-        $uri = self::containerCredentialsUri();
-
-        if ($uri !== null) {
-            $config['uri'] = $uri;
-        }
-
-        $authorization = getenv('AWS_CONTAINER_AUTHORIZATION_TOKEN');
-
-        if (is_string($authorization) && $authorization !== '') {
-            $config['authorization'] = $authorization;
-        } else {
-            $tokenFile = getenv('AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE');
-
-            if (is_string($tokenFile) && $tokenFile !== '' && is_readable($tokenFile)) {
-                $token = trim((string) file_get_contents($tokenFile));
-
-                if ($token !== '') {
-                    $config['authorization'] = $token;
-                }
-            }
-        }
-
-        $config['timeout'] = max(1, (int) env('AWS_CONTAINER_CREDENTIALS_TIMEOUT', 5));
-
-        return $config;
+        return new EcsCredentialProvider(self::ecsProviderConfig());
     }
 
     protected static function hasAuthorizationToken(): bool
