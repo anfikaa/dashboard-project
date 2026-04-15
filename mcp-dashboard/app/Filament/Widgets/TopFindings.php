@@ -80,6 +80,24 @@ class TopFindings extends TableWidget
 
                 Tables\Columns\TextColumn::make('scan_finding')
                     ->label('Finding')
+                    ->limit(240)
+                    ->tooltip(fn (array $record): ?string => filled($record['scan_finding'] ?? null) ? $record['scan_finding'] : null)
+                    ->action(
+                        Action::make('viewFinding')
+                            ->modalHeading('Finding Preview')
+                            ->fillForm(fn (array $record): array => [
+                                'finding_preview' => $record['scan_finding'] ?? '',
+                            ])
+                            ->schema([
+                                Textarea::make('finding_preview')
+                                    ->label('Finding')
+                                    ->rows(14)
+                                    ->disabled(),
+                            ])
+                            ->modalWidth('4xl')
+                            ->modalSubmitAction(false)
+                            ->modalCancelAction(fn (Action $action) => $action->label('Close'))
+                    )
                     ->wrap()
                     ->extraHeaderAttributes(['style' => 'width: 18rem;'])
                     ->extraAttributes(['style' => 'width: 18rem; min-width: 18rem; max-width: 18rem; white-space: normal; vertical-align: top;']),

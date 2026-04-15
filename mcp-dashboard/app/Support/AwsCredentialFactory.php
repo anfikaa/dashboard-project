@@ -32,7 +32,7 @@ class AwsCredentialFactory
     public static function provider(): callable
     {
         $provider = self::usingInjectedContainerCredentials()
-            ? CredentialProvider::containerCredentials(self::containerProviderConfig())
+            ? self::makeContainerCredentialProvider()
             : CredentialProvider::defaultProvider();
 
         return CredentialProvider::memoize($provider);
@@ -59,6 +59,7 @@ class AwsCredentialFactory
     {
         return [
             'aws_credential_mode' => self::usingInjectedContainerCredentials() ? 'container' : 'default-chain',
+            'aws_credential_provider_method' => self::containerProviderMethod(),
             'aws_container_credentials_uri_present' => self::containerCredentialsUri() !== null,
             'aws_container_authorization_token_present' => self::hasAuthorizationToken(),
             'aws_profile_active' => self::sharedProfile(),
@@ -67,6 +68,34 @@ class AwsCredentialFactory
             'aws_endpoint' => env('AWS_ENDPOINT'),
             'aws_dynamodb_endpoint' => env('AWS_DYNAMODB_ENDPOINT'),
         ];
+    }
+
+    protected static function makeContainerCredentialProvider(): callable
+    {
+        $method = self::containerProviderMethod();
+
+        return match ($method) {
+            'containerCredentials' => CredentialProvider::containerCredentials(self::containerProviderConfig()),
+            'ecsCredentials' => CredentialProvider::ecsCredentials(self::ecsProviderConfig()),
+            default => CredentialProvider::defaultProvider(),
+        };
+    }
+
+    protected static function containerProviderMethod(): string
+    {
+        if (! self::usingInjectedContainerCredentials()) {
+            return 'defaultProvider';
+        }
+
+        if (method_exists(CredentialProvider::class, 'containerCredentials')) {
+            return 'containerCredentials';
+        }
+
+        if (method_exists(CredentialProvider::class, 'ecsCredentials')) {
+            return 'ecsCredentials';
+        }
+
+        return 'defaultProvider';
     }
 
     protected static function containerProviderConfig(): array
@@ -110,6 +139,14 @@ class AwsCredentialFactory
         $tokenFile = getenv('AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE');
 
         return is_string($tokenFile) && $tokenFile !== '' && is_readable($tokenFile);
+    }
+
+    protected static function ecsProviderConfig(): array
+    {
+        return [
+            'timeout' => max(1, (int) env('AWS_CONTAINER_CREDENTIALS_TIMEOUT', 5)),
+            'retries' => max(0, (int) env('AWS_METADATA_SERVICE_NUM_ATTEMPTS', 1)),
+        ];
     }
 
     protected static function containerCredentialsUri(): ?string

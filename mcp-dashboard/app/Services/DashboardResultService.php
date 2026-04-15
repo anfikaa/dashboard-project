@@ -6,6 +6,7 @@ use App\Models\SecurityTaskResult;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Throwable;
@@ -169,6 +170,19 @@ class DashboardResultService
 
                 return $databaseFindings
                     ->map(fn (array $finding): array => $this->serializeFinding($finding))
+                        ->values()
+                        ->all();
+            }
+
+            $rawFindings = $this->loadRawStdoutFallbackFindings();
+
+            if ($rawFindings->isNotEmpty()) {
+                Log::info('Dashboard served raw stdout preview fallback findings.', [
+                    'raw_findings_count' => $rawFindings->count(),
+                ]);
+
+                return $rawFindings
+                    ->map(fn (array $finding): array => $this->serializeFinding($finding))
                     ->values()
                     ->all();
             }
@@ -191,6 +205,82 @@ class DashboardResultService
             ->latest('scanned_at')
             ->get()
             ->map(fn (SecurityTaskResult $result): array => $this->mapDatabaseFinding($result))
+            ->values();
+    }
+
+    protected function loadRawStdoutFallbackFindings(): Collection
+    {
+        $maxTasks = max(5, (int) env('DASHBOARD_RAW_TASK_LOOKBACK', 20));
+
+        return collect(
+            DB::table('security_tasks')
+                ->select(['task_id', 'status', 'summary', 'completed_at', 'updated_at'])
+                ->whereNotNull('summary')
+                ->orderByDesc('completed_at')
+                ->orderByDesc('updated_at')
+                ->limit($maxTasks)
+                ->get()
+        )
+            ->flatMap(function (object $task): Collection {
+                $summary = json_decode((string) ($task->summary ?? ''), true);
+
+                if (! is_array($summary)) {
+                    return collect();
+                }
+
+                return collect($summary['dispatches'] ?? [])
+                    ->filter(fn (mixed $dispatch): bool => is_array($dispatch))
+                    ->map(function (array $dispatch) use ($task): ?array {
+                        $agentResponse = collect($dispatch['agent_response'] ?? [])
+                            ->first(fn (mixed $entry): bool => is_array($entry) && is_array($entry['result'] ?? null));
+
+                        $result = is_array($agentResponse) ? ($agentResponse['result'] ?? null) : null;
+
+                        if (! is_array($result)) {
+                            return null;
+                        }
+
+                        $stdoutPreview = $this->makeStdoutPreview($result['stdout'] ?? null);
+
+                        if (blank($stdoutPreview)) {
+                            return null;
+                        }
+
+                        $scanStatus = Str::upper((string) ($dispatch['remote_status'] ?? $dispatch['status'] ?? $task->status ?? 'COMPLETED'));
+                        $statusBucket = $scanStatus === 'FAILED' ? 'FAIL' : 'WARN';
+                        $tool = (string) ($dispatch['tool'] ?? 'unknown');
+                        $clusterName = (string) ($dispatch['cluster_name'] ?? 'Unknown cluster');
+                        $scannedAt = $dispatch['imported_at']
+                            ?? $dispatch['completed_at']
+                            ?? $task->completed_at
+                            ?? $task->updated_at;
+
+                        return [
+                            'tool' => $tool,
+                            'scan_id' => (string) ($task->task_id ?? 'unknown-task'),
+                            'scan_status' => $scanStatus,
+                            'cluster_name' => $clusterName,
+                            'scanned_at' => $this->normalizeScannedAt($scannedAt),
+                            'status_bucket' => $statusBucket,
+                            'description' => $stdoutPreview,
+                            'recommendation' => 'Raw stdout preview from the latest task result. Open the task detail or S3 result file for the full output.',
+                            'suggestion' => 'Use this preview as a temporary fallback while structured parsing from S3 is still being fixed.',
+                            'object' => 'Raw stdout preview',
+                            'metadata' => [
+                                'tool' => $tool,
+                                'scan_id' => $task->task_id,
+                                'scan_status' => $scanStatus,
+                                'cluster_name' => $clusterName,
+                                'object' => 'Raw stdout preview',
+                                'raw_stdout_preview' => $stdoutPreview,
+                                'remote_task_id' => $dispatch['remote_task_id'] ?? null,
+                                'result_prefix' => $dispatch['result_prefix'] ?? null,
+                            ],
+                        ];
+                    })
+                    ->filter()
+                    ->values();
+            })
             ->values();
     }
 
@@ -279,6 +369,25 @@ class DashboardResultService
             filled($metadata['rule_name'] ?? null) ? 'Rule ' . $metadata['rule_name'] : null,
             filled($metadata['file_path'] ?? null) ? 'File ' . $metadata['file_path'] : null,
         ])->filter()->join(' | ') ?: 'Finding context';
+    }
+
+    protected function makeStdoutPreview(mixed $stdout): ?string
+    {
+        if (is_array($stdout)) {
+            $stdout = json_encode($stdout, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+        }
+
+        if (! is_string($stdout) || blank(trim($stdout))) {
+            return null;
+        }
+
+        $normalized = preg_replace('/\s+/u', ' ', trim($stdout));
+
+        if (! is_string($normalized) || $normalized === '') {
+            return null;
+        }
+
+        return Str::words($normalized, 500, ' ...');
     }
 
     protected function serializeFinding(array $finding): array
