@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Models\SecurityTask;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
@@ -17,6 +18,8 @@ class ScanService
     protected ?Collection $availableSampleFilesCache = null;
 
     protected array $prefixFileCache = [];
+
+    protected bool $s3UnavailableForRequest = false;
 
     public function getAvailableSampleFiles(?array $tools = null): Collection
     {
@@ -75,8 +78,19 @@ class ScanService
             ->values();
 
         $files = $this->getRecentS3FilesByTool($disk, $requestedTools);
+        $limited = $this->limitS3Files($files);
 
-        return $this->limitS3Files($files);
+        Log::info('Dashboard selected S3 candidate files.', [
+            'requested_tools' => $requestedTools->values()->all(),
+            'selected_files' => $limited->map(fn (array $file): array => [
+                'tool' => $file['tool'] ?? null,
+                'path' => $file['path'] ?? null,
+                'fallback_paths' => $file['fallback_paths'] ?? [],
+                'prefix' => $file['prefix'] ?? null,
+            ])->values()->all(),
+        ]);
+
+        return $limited;
     }
 
     public function getS3ResultFiles(string $prefix): Collection
@@ -157,6 +171,7 @@ class ScanService
     protected function getRecentResultPrefixesByTool(Collection $requestedTools): Collection
     {
         $maxTasks = max(10, (int) env('SCAN_S3_TASK_LOOKBACK', 50));
+        $perToolCandidates = max(1, (int) env('SCAN_S3_PREFIX_CANDIDATES_PER_TOOL', 5));
 
         return collect(
             DB::table('security_tasks')
@@ -194,7 +209,8 @@ class ScanService
                     && $requestedTools->contains($dispatch['tool']);
             })
             ->sortByDesc(fn (array $dispatch): int => (int) ($dispatch['completed_at'] ?? 0))
-            ->unique('tool')
+            ->groupBy('tool')
+            ->flatMap(fn (Collection $group): Collection => $group->take($perToolCandidates))
             ->values();
     }
 
@@ -217,6 +233,15 @@ class ScanService
 
     public function parseFile(array $file): Collection
     {
+        if (($file['disk'] ?? null) === env('SCAN_S3_DISK', 's3') && $this->shouldShortCircuitS3Reads()) {
+            Log::warning('Skipping S3 parse because scan service circuit breaker is active.', [
+                'tool' => $file['tool'] ?? null,
+                'path' => $file['path'] ?? null,
+            ]);
+
+            return collect();
+        }
+
         $paths = array_values(array_unique(array_filter([
             $file['path'] ?? null,
             ...($file['fallback_paths'] ?? []),
@@ -229,6 +254,22 @@ class ScanService
                 return $this->parseSampleFile($path, $file['tool'], $file['disk'] ?? null);
             } catch (\Throwable $exception) {
                 $lastException = $exception;
+
+                if (($file['disk'] ?? null) === env('SCAN_S3_DISK', 's3') && $this->isS3ConnectivityException($exception)) {
+                    $this->markS3Unavailable($exception);
+
+                    Log::warning('Stopping S3 parse early because of connectivity/read failure.', [
+                        'tool' => $file['tool'] ?? null,
+                        'path' => $path,
+                        'error' => $exception->getMessage(),
+                    ]);
+
+                    return collect();
+                }
+
+                if (Str::contains($exception->getMessage(), 'Unable to read file from location')) {
+                    continue;
+                }
 
                 if (! Str::contains($exception->getMessage(), 'Unable to read file from location')) {
                     throw $exception;
@@ -244,7 +285,23 @@ class ScanService
             $discoveredPath = $this->discoverS3ResultPathInPrefix($disk, $prefix, $tool, $paths);
 
             if ($discoveredPath !== null) {
-                return $this->parseSampleFile($discoveredPath, $tool, $disk);
+                try {
+                    return $this->parseSampleFile($discoveredPath, $tool, $disk);
+                } catch (\Throwable $exception) {
+                    if ($this->isS3ConnectivityException($exception)) {
+                        $this->markS3Unavailable($exception);
+
+                        Log::warning('Stopping discovered S3 parse because of connectivity/read failure.', [
+                            'tool' => $tool,
+                            'path' => $discoveredPath,
+                            'error' => $exception->getMessage(),
+                        ]);
+
+                        return collect();
+                    }
+
+                    throw $exception;
+                }
             }
         }
 
@@ -261,7 +318,7 @@ class ScanService
         $tool = $this->normalizeToolName($tool) ?? $tool;
 
         $candidates = match ($tool) {
-            'kubebench' => ['result-kubebench.json', 'result-kube-bench.json', 'result.json'],
+            'kubebench' => ['result-kubebench.json', 'result-kube-bench.json', 'result-kube_bench.json', 'result.json'],
             'kubescape' => ['result-kubescape.json', 'result-kube-escape.json', 'result.json'],
             'checkov' => ['result-checkov.json', 'result.json'],
             'nmap' => ['result-nmap.json', 'result.json'],
@@ -269,10 +326,22 @@ class ScanService
             default => ['result-' . $tool . '.json', 'result.json'],
         };
 
-        return array_map(
-            fn (string $filename): string => $prefix . '/' . $filename,
-            array_values(array_unique($candidates)),
-        );
+        $prefixes = [$prefix];
+        $parentPrefix = preg_replace('#/[^/]+$#', '', $prefix);
+
+        if (is_string($parentPrefix) && $parentPrefix !== '' && $parentPrefix !== $prefix) {
+            $prefixes[] = $parentPrefix;
+        }
+
+        $paths = [];
+
+        foreach (array_values(array_unique($prefixes)) as $candidatePrefix) {
+            foreach (array_values(array_unique($candidates)) as $filename) {
+                $paths[] = $candidatePrefix . '/' . $filename;
+            }
+        }
+
+        return array_values(array_unique($paths));
     }
 
     protected function discoverS3ResultPathInPrefix(string $disk, string $prefix, string $tool, array $excludedPaths = []): ?string
@@ -320,6 +389,10 @@ class ScanService
 
     protected function listS3PrefixFiles(string $disk, string $prefix): Collection
     {
+        if ($this->shouldShortCircuitS3Reads()) {
+            return collect();
+        }
+
         $key = $disk . '|' . $prefix;
 
         if (array_key_exists($key, $this->prefixFileCache)) {
@@ -332,6 +405,10 @@ class ScanService
                 ->values()
                 ->all();
         } catch (\Throwable $exception) {
+            if ($this->isS3ConnectivityException($exception)) {
+                $this->markS3Unavailable($exception);
+            }
+
             Log::warning('Unable to inspect S3 result prefix.', [
                 'disk' => $disk,
                 'prefix' => $prefix,
@@ -346,12 +423,96 @@ class ScanService
         return collect($files);
     }
 
+    protected function shouldShortCircuitS3Reads(): bool
+    {
+        if ($this->s3UnavailableForRequest) {
+            return true;
+        }
+
+        return Cache::has($this->s3UnavailableCacheKey());
+    }
+
+    protected function markS3Unavailable(\Throwable $exception): void
+    {
+        $this->s3UnavailableForRequest = true;
+
+        Cache::put(
+            $this->s3UnavailableCacheKey(),
+            [
+                'message' => Str::limit($exception->getMessage(), 300),
+                'at' => now()->toIso8601String(),
+            ],
+            now()->addSeconds(max(10, (int) env('SCAN_S3_UNAVAILABLE_TTL_SECONDS', 30))),
+        );
+
+        Log::warning('Marked S3 as temporarily unavailable for dashboard parsing.', [
+            'message' => Str::limit($exception->getMessage(), 300),
+            'ttl_seconds' => max(10, (int) env('SCAN_S3_UNAVAILABLE_TTL_SECONDS', 30)),
+        ]);
+    }
+
+    protected function s3UnavailableCacheKey(): string
+    {
+        return 'scan-service.s3-unavailable.' . md5(json_encode([
+            'disk' => env('SCAN_S3_DISK', 's3'),
+            'bucket' => env('AWS_BUCKET'),
+            'endpoint' => env('AWS_ENDPOINT'),
+        ]));
+    }
+
+    protected function isS3ConnectivityException(\Throwable $exception): bool
+    {
+        $message = Str::lower($exception->getMessage());
+
+        return Str::contains($message, [
+            'could not resolve host',
+            'connection timed out',
+            'timed out',
+            'curl error',
+            'unable to list contents',
+            'aws http error',
+        ]);
+    }
+
     public function getNormalizedFindingsForTools(array $tools): Collection
     {
         $files = $this->getAvailableSampleFiles($tools);
 
         if ($files->isEmpty()) {
             throw new RuntimeException('No matching scan sample files were found for the selected tools.');
+        }
+
+        if (env('SCAN_SOURCE', 'local') === 's3') {
+            return $files
+                ->groupBy(fn (array $file): string => (string) ($file['tool'] ?? 'unknown'))
+                ->flatMap(function (Collection $group, string $tool): Collection {
+                    foreach ($group as $file) {
+                        try {
+                            $findings = $this->parseFile($file);
+
+                            if ($findings->isNotEmpty()) {
+                                Log::info('Dashboard selected a working S3 result file for tool.', [
+                                    'tool' => $tool,
+                                    'path' => $file['path'] ?? null,
+                                    'fallback_paths' => $file['fallback_paths'] ?? [],
+                                    'findings_count' => $findings->count(),
+                                ]);
+
+                                return $findings;
+                            }
+                        } catch (\Throwable $exception) {
+                            Log::warning('Skipping scan file because parsing failed.', [
+                                'path' => $file['path'] ?? null,
+                                'tool' => $file['tool'] ?? null,
+                                'disk' => $file['disk'] ?? null,
+                                'error' => $exception->getMessage(),
+                            ]);
+                        }
+                    }
+
+                    return collect();
+                })
+                ->values();
         }
 
         return $files

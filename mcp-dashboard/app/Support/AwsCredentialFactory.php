@@ -6,6 +6,8 @@ use Aws\Credentials\CredentialProvider;
 
 class AwsCredentialFactory
 {
+    protected const ECS_CONTAINER_METADATA_HOST = 'http://169.254.170.2';
+
     public static function debugEnabled(): bool
     {
         return filter_var(env('AWS_CREDENTIAL_DEBUG', false), FILTER_VALIDATE_BOOL);
@@ -39,8 +41,18 @@ class AwsCredentialFactory
     public static function applyToConfig(array $config): array
     {
         $config['credentials'] = self::provider();
+        $config['ec2_metadata_v1_disabled'] = true;
 
         return $config;
+    }
+
+    public static function disableInstanceMetadataWhenNeeded(): void
+    {
+        if (self::usingInjectedContainerCredentials()) {
+            putenv('AWS_EC2_METADATA_DISABLED=true');
+            $_ENV['AWS_EC2_METADATA_DISABLED'] = 'true';
+            $_SERVER['AWS_EC2_METADATA_DISABLED'] = 'true';
+        }
     }
 
     public static function debugContext(): array
@@ -102,12 +114,16 @@ class AwsCredentialFactory
 
     protected static function containerCredentialsUri(): ?string
     {
-        foreach (['AWS_CONTAINER_CREDENTIALS_FULL_URI', 'AWS_CONTAINER_CREDENTIALS_RELATIVE_URI'] as $key) {
-            $value = getenv($key);
+        $fullUri = getenv('AWS_CONTAINER_CREDENTIALS_FULL_URI');
 
-            if (is_string($value) && $value !== '') {
-                return $value;
-            }
+        if (is_string($fullUri) && $fullUri !== '') {
+            return $fullUri;
+        }
+
+        $relativeUri = getenv('AWS_CONTAINER_CREDENTIALS_RELATIVE_URI');
+
+        if (is_string($relativeUri) && $relativeUri !== '') {
+            return rtrim(self::ECS_CONTAINER_METADATA_HOST, '/') . '/' . ltrim($relativeUri, '/');
         }
 
         return null;

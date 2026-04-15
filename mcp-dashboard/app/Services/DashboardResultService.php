@@ -6,6 +6,7 @@ use App\Models\SecurityTaskResult;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Throwable;
 
@@ -114,11 +115,23 @@ class DashboardResultService
 
         $items = Cache::remember($cacheKey, now()->addSeconds($ttl), function (): array {
             $preferS3 = env('SCAN_SOURCE', 'local') === 's3';
+            $databaseCount = SecurityTaskResult::query()->count();
+            $cacheTtl = max(1, (int) env('SCAN_CACHE_TTL_SECONDS', 300));
+
+            Log::info('Dashboard findings refresh started.', [
+                'prefer_s3' => $preferS3,
+                'database_results_count' => $databaseCount,
+                'cache_ttl_seconds' => $cacheTtl,
+            ]);
 
             if (! $preferS3) {
                 $databaseFindings = $this->loadFindingsFromDatabase();
 
                 if ($databaseFindings->isNotEmpty()) {
+                    Log::info('Dashboard served findings from database only.', [
+                        'database_findings_count' => $databaseFindings->count(),
+                    ]);
+
                     return $databaseFindings
                         ->map(fn (array $finding): array => $this->serializeFinding($finding))
                         ->values()
@@ -133,8 +146,16 @@ class DashboardResultService
                     ->values();
 
                 if ($s3Findings->isNotEmpty()) {
+                    Log::info('Dashboard served findings from S3 parsing.', [
+                        's3_findings_count' => $s3Findings->count(),
+                    ]);
+
                     return $s3Findings->all();
                 }
+
+                Log::warning('Dashboard S3 parsing completed but returned no findings.', [
+                    'database_results_count' => $databaseCount,
+                ]);
             } catch (Throwable) {
                 // Fall back to database below.
             }
@@ -142,11 +163,19 @@ class DashboardResultService
             $databaseFindings = $this->loadFindingsFromDatabase();
 
             if ($databaseFindings->isNotEmpty()) {
+                Log::info('Dashboard fell back to database findings after S3 attempt.', [
+                    'database_findings_count' => $databaseFindings->count(),
+                ]);
+
                 return $databaseFindings
                     ->map(fn (array $finding): array => $this->serializeFinding($finding))
                     ->values()
                     ->all();
             }
+
+            Log::warning('Dashboard has no findings available from either S3 or database.', [
+                'database_results_count' => $databaseCount,
+            ]);
 
             return [];
         });

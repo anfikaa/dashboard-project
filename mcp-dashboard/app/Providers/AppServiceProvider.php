@@ -21,6 +21,8 @@ class AppServiceProvider extends ServiceProvider
      */
     public function boot(): void
     {
+        AwsCredentialFactory::disableInstanceMetadataWhenNeeded();
+
         if (AwsCredentialFactory::debugEnabled()) {
             Log::info('AWS credential resolution initialized.', AwsCredentialFactory::debugContext());
         }
