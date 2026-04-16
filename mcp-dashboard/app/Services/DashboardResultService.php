@@ -2,7 +2,6 @@
 
 namespace App\Services;
 
-use App\Models\SecurityTaskResult;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
@@ -13,7 +12,7 @@ use Throwable;
 
 class DashboardResultService
 {
-    protected const CACHE_VERSION = '2026-04-14-dashboard-db-v3';
+    protected const CACHE_VERSION = '2026-04-16-dashboard-remote-first-v1';
 
     protected ?Collection $requestFindingsCache = null;
 
@@ -108,80 +107,51 @@ class DashboardResultService
         $ttl = max(1, (int) env('SCAN_CACHE_TTL_SECONDS', 300));
         $cacheKey = 'dashboard.findings.' . md5(json_encode([
             'version' => self::CACHE_VERSION,
-            'results_updated_at' => SecurityTaskResult::query()->max('updated_at'),
+            'results_updated_at' => DB::table('security_task_results')->max('updated_at'),
+            'tasks_updated_at' => DB::table('security_tasks')->max('updated_at'),
+            'tasks_completed_at' => DB::table('security_tasks')->max('completed_at'),
+            'tasks_count' => DB::table('security_tasks')->count(),
             'scan_source' => env('SCAN_SOURCE', 'local'),
             'disk' => env('SCAN_S3_DISK', 's3'),
             'prefix' => env('SCAN_S3_PREFIX', 'result'),
         ]));
 
         $items = Cache::remember($cacheKey, now()->addSeconds($ttl), function (): array {
-            $preferS3 = env('SCAN_SOURCE', 'local') === 's3';
-            $databaseCount = SecurityTaskResult::query()->count();
+            $databaseCount = DB::table('security_task_results')->count();
+            $taskCount = DB::table('security_tasks')->count();
             $cacheTtl = max(1, (int) env('SCAN_CACHE_TTL_SECONDS', 300));
+            $preferS3 = env('SCAN_SOURCE', 'local') === 's3';
 
             Log::info('Dashboard findings refresh started.', [
                 'prefer_s3' => $preferS3,
                 'database_results_count' => $databaseCount,
+                'security_tasks_count' => $taskCount,
                 'cache_ttl_seconds' => $cacheTtl,
             ]);
 
-            if (! $preferS3) {
-                $databaseFindings = $this->loadFindingsFromDatabase();
+            if ($preferS3) {
+                $remoteFindings = $this->loadRemoteFindings();
 
-                if ($databaseFindings->isNotEmpty()) {
-                    Log::info('Dashboard served findings from database only.', [
-                        'database_findings_count' => $databaseFindings->count(),
+                if ($remoteFindings->isNotEmpty()) {
+                    Log::info('Dashboard served tool summaries directly from DynamoDB/S3.', [
+                        'remote_records_count' => $remoteFindings->count(),
                     ]);
 
-                    return $databaseFindings
+                    return $remoteFindings
                         ->map(fn (array $finding): array => $this->serializeFinding($finding))
                         ->values()
                         ->all();
                 }
             }
 
-            try {
-                $s3Findings = $this->scanService
-                    ->getNormalizedFindingsForTools(array_keys(TaskExecutionService::getAvailableTools()))
-                    ->map(fn (array $finding): array => $this->serializeFinding($finding))
-                    ->values();
-
-                if ($s3Findings->isNotEmpty()) {
-                    Log::info('Dashboard served findings from S3 parsing.', [
-                        's3_findings_count' => $s3Findings->count(),
-                    ]);
-
-                    return $s3Findings->all();
-                }
-
-                Log::warning('Dashboard S3 parsing completed but returned no findings.', [
-                    'database_results_count' => $databaseCount,
-                ]);
-            } catch (Throwable) {
-                // Fall back to database below.
-            }
-
-            $databaseFindings = $this->loadFindingsFromDatabase();
+            $databaseFindings = $this->loadCachedFindingsFromDatabase();
 
             if ($databaseFindings->isNotEmpty()) {
-                Log::info('Dashboard fell back to database findings after S3 attempt.', [
+                Log::info('Dashboard served findings from SQLite cache fallback.', [
                     'database_findings_count' => $databaseFindings->count(),
                 ]);
 
                 return $databaseFindings
-                    ->map(fn (array $finding): array => $this->serializeFinding($finding))
-                        ->values()
-                        ->all();
-            }
-
-            $rawFindings = $this->loadRawStdoutFallbackFindings();
-
-            if ($rawFindings->isNotEmpty()) {
-                Log::info('Dashboard served raw stdout preview fallback findings.', [
-                    'raw_findings_count' => $rawFindings->count(),
-                ]);
-
-                return $rawFindings
                     ->map(fn (array $finding): array => $this->serializeFinding($finding))
                     ->values()
                     ->all();
@@ -189,6 +159,7 @@ class DashboardResultService
 
             Log::warning('Dashboard has no findings available from either S3 or database.', [
                 'database_results_count' => $databaseCount,
+                'security_tasks_count' => $taskCount,
             ]);
 
             return [];
@@ -196,129 +167,177 @@ class DashboardResultService
 
         return $this->requestFindingsCache = collect($items)
             ->map(fn (array $finding): array => $this->hydrateFinding($finding))
+            ->filter(fn (array $finding): bool => in_array(Str::upper((string) ($finding['scan_status'] ?? '')), ['COMPLETED', 'FAILED'], true))
             ->values();
     }
 
-    protected function loadFindingsFromDatabase(): Collection
+    protected function loadRemoteFindings(): Collection
     {
-        return SecurityTaskResult::query()
-            ->latest('scanned_at')
-            ->get()
-            ->map(fn (SecurityTaskResult $result): array => $this->mapDatabaseFinding($result))
-            ->values();
+        try {
+            return $this->scanService
+                ->getToolResultSummaries(array_keys(TaskExecutionService::getAvailableTools()))
+                ->values();
+        } catch (Throwable $exception) {
+            Log::warning('Dashboard remote findings read failed.', [
+                'error' => $exception->getMessage(),
+            ]);
+
+            return collect();
+        }
     }
 
-    protected function loadRawStdoutFallbackFindings(): Collection
+    protected function loadCachedFindingsFromDatabase(): Collection
     {
-        $maxTasks = max(5, (int) env('DASHBOARD_RAW_TASK_LOOKBACK', 20));
-
-        return collect(
-            DB::table('security_tasks')
-                ->select(['task_id', 'status', 'summary', 'completed_at', 'updated_at'])
-                ->whereNotNull('summary')
-                ->orderByDesc('completed_at')
-                ->orderByDesc('updated_at')
-                ->limit($maxTasks)
+        return $this->aggregateFindingsByScanTool(
+            collect(
+            DB::table('security_task_results')
+                ->select([
+                    'task_identifier',
+                    'source_tool',
+                    'cluster_name',
+                    'severity',
+                    'scan_finding',
+                    'recommendation',
+                    'suggestion',
+                    'metadata',
+                    'scanned_at',
+                ])
+                ->orderByDesc('scanned_at')
                 ->get()
-        )
-            ->flatMap(function (object $task): Collection {
-                $summary = json_decode((string) ($task->summary ?? ''), true);
-
-                if (! is_array($summary)) {
-                    return collect();
-                }
-
-                return collect($summary['dispatches'] ?? [])
-                    ->filter(fn (mixed $dispatch): bool => is_array($dispatch))
-                    ->map(function (array $dispatch) use ($task): ?array {
-                        $agentResponse = collect($dispatch['agent_response'] ?? [])
-                            ->first(fn (mixed $entry): bool => is_array($entry) && is_array($entry['result'] ?? null));
-
-                        $result = is_array($agentResponse) ? ($agentResponse['result'] ?? null) : null;
-
-                        if (! is_array($result)) {
-                            return null;
-                        }
-
-                        $stdoutPreview = $this->makeStdoutPreview($result['stdout'] ?? null);
-
-                        if (blank($stdoutPreview)) {
-                            return null;
-                        }
-
-                        $scanStatus = Str::upper((string) ($dispatch['remote_status'] ?? $dispatch['status'] ?? $task->status ?? 'COMPLETED'));
-                        $statusBucket = $scanStatus === 'FAILED' ? 'FAIL' : 'WARN';
-                        $tool = (string) ($dispatch['tool'] ?? 'unknown');
-                        $clusterName = (string) ($dispatch['cluster_name'] ?? 'Unknown cluster');
-                        $scannedAt = $dispatch['imported_at']
-                            ?? $dispatch['completed_at']
-                            ?? $task->completed_at
-                            ?? $task->updated_at;
-
-                        return [
-                            'tool' => $tool,
-                            'scan_id' => (string) ($task->task_id ?? 'unknown-task'),
-                            'scan_status' => $scanStatus,
-                            'cluster_name' => $clusterName,
-                            'scanned_at' => $this->normalizeScannedAt($scannedAt),
-                            'status_bucket' => $statusBucket,
-                            'description' => $stdoutPreview,
-                            'recommendation' => 'Raw stdout preview from the latest task result. Open the task detail or S3 result file for the full output.',
-                            'suggestion' => 'Use this preview as a temporary fallback while structured parsing from S3 is still being fixed.',
-                            'object' => 'Raw stdout preview',
-                            'metadata' => [
-                                'tool' => $tool,
-                                'scan_id' => $task->task_id,
-                                'scan_status' => $scanStatus,
-                                'cluster_name' => $clusterName,
-                                'object' => 'Raw stdout preview',
-                                'raw_stdout_preview' => $stdoutPreview,
-                                'remote_task_id' => $dispatch['remote_task_id'] ?? null,
-                                'result_prefix' => $dispatch['result_prefix'] ?? null,
-                            ],
-                        ];
-                    })
-                    ->filter()
-                    ->values();
-            })
-            ->values();
+            )
+                ->map(fn (object $result): array => $this->mapDatabaseFinding((array) $result))
+                ->filter(fn (array $finding): bool => $this->isRemoteBackedCachedFinding($finding))
+                ->values()
+        );
     }
 
-    protected function mapDatabaseFinding(SecurityTaskResult $result): array
+    protected function isRemoteBackedCachedFinding(array $finding): bool
     {
-        $metadata = is_array($result->metadata) ? $result->metadata : [];
-        $bucket = Str::upper((string) ($metadata['status_bucket'] ?? $result->severity ?? 'WARN'));
+        $metadata = $finding['metadata'] ?? [];
+
+        foreach ([
+            $metadata['remote_task_id'] ?? null,
+            $metadata['s3_prefix'] ?? null,
+            $metadata['s3_path'] ?? null,
+        ] as $candidate) {
+            if (is_string($candidate) && filled($candidate)) {
+                return true;
+            }
+        }
+
+        $scanId = $finding['scan_id'] ?? null;
+
+        return is_string($scanId) && Str::isUuid($scanId);
+    }
+
+    protected function mapDatabaseFinding(array $result): array
+    {
+        $metadata = json_decode((string) ($result['metadata'] ?? ''), true);
+        $metadata = is_array($metadata) ? $metadata : [];
+        $bucket = Str::upper((string) ($metadata['status_bucket'] ?? $result['severity'] ?? 'WARN'));
         $scanStatus = $metadata['scan_status']
-            ?? (Str::contains(Str::lower((string) $result->scan_finding), 'execution failed') ? 'FAILED' : 'COMPLETED');
+            ?? (Str::contains(Str::lower((string) ($result['scan_finding'] ?? '')), 'execution failed') ? 'FAILED' : 'COMPLETED');
 
         return [
-            'tool' => (string) ($result->source_tool ?? $metadata['tool'] ?? 'unknown'),
-            'scan_id' => (string) ($result->task_identifier ?? $metadata['scan_id'] ?? 'unknown-task'),
+            'tool' => (string) ($result['source_tool'] ?? $metadata['tool'] ?? 'unknown'),
+            'scan_id' => (string) ($metadata['remote_task_id'] ?? $metadata['scan_id'] ?? $result['task_identifier'] ?? 'unknown-task'),
             'scan_status' => Str::upper((string) $scanStatus),
-            'cluster_name' => (string) ($result->cluster_name ?? $metadata['cluster_name'] ?? 'Unknown cluster'),
-            'scanned_at' => $this->normalizeScannedAt($result->scanned_at),
+            'cluster_name' => (string) ($result['cluster_name'] ?? $metadata['cluster_name'] ?? 'Unknown cluster'),
+            'scanned_at' => $this->normalizeScannedAt($result['scanned_at'] ?? null),
             'status_bucket' => $bucket,
-            'description' => (string) ($result->scan_finding ?? 'Finding generated from imported scan result.'),
-            'recommendation' => (string) ($result->recommendation ?? 'Review the reported issue and apply the recommended control.'),
-            'suggestion' => (string) ($result->suggestion ?? 'Review this finding with the security team and remediate as needed.'),
-            'object' => (string) ($metadata['object'] ?? $metadata['resource'] ?? $metadata['name'] ?? $result->cluster_name ?? 'Finding context'),
+            'description' => (string) ($result['scan_finding'] ?? 'Finding generated from imported scan result.'),
+            'recommendation' => (string) ($result['recommendation'] ?? 'Review the reported issue and apply the recommended control.'),
+            'suggestion' => (string) ($result['suggestion'] ?? 'Review this finding with the security team and remediate as needed.'),
+            'object' => (string) ($metadata['object'] ?? $metadata['resource'] ?? $metadata['name'] ?? $result['cluster_name'] ?? 'Finding context'),
             'metadata' => array_merge($metadata, [
-                'scan_id' => $metadata['scan_id'] ?? $result->task_identifier,
+                'scan_id' => $metadata['remote_task_id'] ?? $metadata['scan_id'] ?? $result['task_identifier'] ?? null,
+                'remote_task_id' => $metadata['remote_task_id'] ?? $metadata['scan_id'] ?? null,
+                'local_task_id' => $metadata['local_task_id'] ?? $result['task_identifier'] ?? null,
                 'scan_status' => Str::upper((string) $scanStatus),
-                'cluster_name' => $metadata['cluster_name'] ?? $result->cluster_name,
-                'object' => $metadata['object'] ?? $metadata['resource'] ?? $metadata['name'] ?? $result->cluster_name,
+                'cluster_name' => $metadata['cluster_name'] ?? $result['cluster_name'] ?? null,
+                'object' => $metadata['object'] ?? $metadata['resource'] ?? $metadata['name'] ?? $result['cluster_name'] ?? null,
             ]),
         ];
+    }
+
+    protected function aggregateFindingsByScanTool(Collection $findings): Collection
+    {
+        return $findings
+            ->groupBy(function (array $finding): string {
+                return implode('|', [
+                    $finding['scan_id'] ?? 'unknown-task',
+                    $finding['tool'] ?? 'unknown-tool',
+                    $finding['cluster_name'] ?? 'unknown-cluster',
+                ]);
+            })
+            ->map(function (Collection $group): array {
+                $group = $group->sortByDesc(fn (array $finding): int => $this->severityRank((string) ($finding['status_bucket'] ?? 'WARN')))->values();
+                $primary = $group->first() ?? [];
+                $counts = [
+                    'PASS' => $group->where('status_bucket', 'PASS')->count(),
+                    'FAIL' => $group->where('status_bucket', 'FAIL')->count(),
+                    'WARN' => $group->where('status_bucket', 'WARN')->count(),
+                ];
+                $statusBucket = $counts['FAIL'] > 0 ? 'FAIL' : ($counts['WARN'] > 0 ? 'WARN' : 'PASS');
+                $topFinding = $primary['description'] ?? 'Parsed scan result summary.';
+                $summary = collect([
+                    $counts['FAIL'] > 0 ? "{$counts['FAIL']} fail" . ($counts['FAIL'] > 1 ? 's' : '') : null,
+                    $counts['WARN'] > 0 ? "{$counts['WARN']} warning" . ($counts['WARN'] > 1 ? 's' : '') : null,
+                    $counts['PASS'] > 0 ? "{$counts['PASS']} pass" . ($counts['PASS'] > 1 ? 'es' : '') : null,
+                ])->filter()->implode(', ');
+
+                return [
+                    'tool' => $primary['tool'] ?? 'unknown',
+                    'scan_id' => $primary['scan_id'] ?? 'unknown-task',
+                    'scan_status' => $primary['scan_status'] ?? 'COMPLETED',
+                    'cluster_name' => $primary['cluster_name'] ?? 'Unknown cluster',
+                    'scanned_at' => $group
+                        ->pluck('scanned_at')
+                        ->filter()
+                        ->sortByDesc(fn (Carbon $value): int => $value->timestamp)
+                        ->first(),
+                    'status_bucket' => $statusBucket,
+                    'description' => trim(implode(' ', array_filter([
+                        $summary !== '' ? 'Summary: ' . $summary . '.' : null,
+                        filled($topFinding) ? 'Top finding: ' . Str::limit($topFinding, 240) : null,
+                    ]))),
+                    'recommendation' => $primary['recommendation'] ?? 'Review the scan result summary and open task findings for detailed remediation.',
+                    'suggestion' => $primary['suggestion'] ?? 'Use this summary to identify the tool result that needs deeper review.',
+                    'object' => $primary['object'] ?? ($primary['cluster_name'] ?? 'Scan result'),
+                    'metadata' => array_merge($primary['metadata'] ?? [], [
+                        'finding_counts' => $counts,
+                        'object' => $primary['cluster_name'] ?? ($primary['object'] ?? 'Scan result'),
+                        'top_finding' => $topFinding,
+                    ]),
+                ];
+            })
+            ->sortByDesc(fn (array $finding): array => [
+                $this->severityRank((string) ($finding['status_bucket'] ?? 'WARN')),
+                $finding['scanned_at'] instanceof Carbon ? $finding['scanned_at']->timestamp : 0,
+            ])
+            ->values();
+    }
+
+    protected function severityRank(string $bucket): int
+    {
+        return match (Str::upper($bucket)) {
+            'FAIL' => 3,
+            'WARN' => 2,
+            'PASS' => 1,
+            default => 0,
+        };
     }
 
     protected function transformFinding(array $finding): array
     {
         $metadata = $finding['metadata'] ?? [];
         $bucket = $finding['status_bucket'];
+        $scanId = $this->resolveDisplayScanId($finding, $metadata);
+        $localTaskId = $this->resolveLocalTaskId($finding, $metadata);
 
         return [
             'key' => implode('-', array_filter([
-                $finding['scan_id'] ?? null,
+                $scanId,
                 $finding['tool'] ?? null,
                 $finding['cluster_name'] ?? null,
                 $metadata['sample_file'] ?? null,
@@ -327,8 +346,9 @@ class DashboardResultService
                 $metadata['rule_uuid'] ?? null,
                 md5(($finding['description'] ?? '') . ($finding['object'] ?? '')),
             ])),
-            'scan_id' => $finding['scan_id'] ?? ($metadata['scan_id'] ?? 'sample-scan'),
-            'task_identifier' => $finding['scan_id'] ?? ($metadata['scan_id'] ?? 'sample-scan'),
+            'scan_id' => $scanId,
+            'task_identifier' => $localTaskId,
+            'local_task_id' => $localTaskId,
             'source_tool' => $finding['tool'],
             'cluster_name' => $finding['cluster_name'],
             'scan_status' => $finding['scan_status'] ?? ($metadata['scan_status'] ?? 'UNKNOWN'),
@@ -353,6 +373,45 @@ class DashboardResultService
         ];
     }
 
+    protected function resolveDisplayScanId(array $finding, array $metadata): string
+    {
+        foreach ([
+            $metadata['remote_task_id'] ?? null,
+            $finding['scan_id'] ?? null,
+            $metadata['scan_id'] ?? null,
+        ] as $candidate) {
+            if (is_string($candidate) && filled($candidate)) {
+                return $candidate;
+            }
+        }
+
+        $prefix = $metadata['s3_prefix'] ?? null;
+
+        if (is_string($prefix) && filled($prefix)) {
+            $segments = array_values(array_filter(explode('/', trim($prefix, '/'))));
+
+            if (($segments[0] ?? null) === 'result' && filled($segments[1] ?? null)) {
+                return (string) $segments[1];
+            }
+        }
+
+        return 'sample-scan';
+    }
+
+    protected function resolveLocalTaskId(array $finding, array $metadata): ?string
+    {
+        foreach ([
+            $metadata['local_task_id'] ?? null,
+            $metadata['task_identifier'] ?? null,
+        ] as $candidate) {
+            if (is_string($candidate) && filled($candidate)) {
+                return $candidate;
+            }
+        }
+
+        return null;
+    }
+
     protected function resolveObjectLabel(array $metadata): string
     {
         foreach (['object', 'resource', 'resource_name', 'object_name', 'name'] as $key) {
@@ -369,25 +428,6 @@ class DashboardResultService
             filled($metadata['rule_name'] ?? null) ? 'Rule ' . $metadata['rule_name'] : null,
             filled($metadata['file_path'] ?? null) ? 'File ' . $metadata['file_path'] : null,
         ])->filter()->join(' | ') ?: 'Finding context';
-    }
-
-    protected function makeStdoutPreview(mixed $stdout): ?string
-    {
-        if (is_array($stdout)) {
-            $stdout = json_encode($stdout, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
-        }
-
-        if (! is_string($stdout) || blank(trim($stdout))) {
-            return null;
-        }
-
-        $normalized = preg_replace('/\s+/u', ' ', trim($stdout));
-
-        if (! is_string($normalized) || $normalized === '') {
-            return null;
-        }
-
-        return Str::words($normalized, 500, ' ...');
     }
 
     protected function serializeFinding(array $finding): array

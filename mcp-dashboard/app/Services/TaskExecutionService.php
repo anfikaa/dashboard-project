@@ -9,6 +9,7 @@ use App\Support\AwsCredentialFactory;
 use Aws\DynamoDb\DynamoDbClient;
 use Aws\DynamoDb\Marshaler;
 use Illuminate\Http\Client\Response;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
@@ -39,6 +40,9 @@ class TaskExecutionService
         $task->loadMissing('clusterAgent');
 
         $agent = $task->clusterAgent;
+        $existingSummary = is_array($task->summary) ? $task->summary : [];
+        $dispatchAllClusters = ($existingSummary['cluster_scope'] ?? null) === 'all';
+        $clusterPayload = $dispatchAllClusters ? 'all' : [(string) $agent?->cluster_name];
         $selectedTools = collect($task->tools ?? [])
             ->filter(fn (?string $tool): bool => array_key_exists((string) $tool, self::getAvailableTools()))
             ->values()
@@ -113,6 +117,9 @@ class TaskExecutionService
                     status: 'PENDING',
                     createdAt: $now,
                     updatedAt: $now,
+                    expectedClusters: $dispatchAllClusters
+                        ? max(1, ClusterAgent::query()->remoteBacked()->active()->count())
+                        : 1,
                 );
 
                 $this->putClusterItem(
@@ -133,6 +140,7 @@ class TaskExecutionService
                         tool: $tool,
                         remoteTaskId: $remoteTaskId,
                         parameters: $parameters,
+                        clusters: $clusterPayload,
                     );
 
                     $this->putMetaItem(
@@ -157,12 +165,13 @@ class TaskExecutionService
                         'tool' => $tool,
                         'tool_label' => self::getAvailableTools()[$tool] ?? $tool,
                         'remote_task_id' => $remoteTaskId,
-                        'cluster_name' => $agent->cluster_name,
+                        'cluster_name' => $dispatchAllClusters ? '' : $agent->cluster_name,
+                        'cluster_scope' => $dispatchAllClusters ? 'all' : 'single',
                         'cluster_sort_key' => $this->makeClusterSortKey($agent),
                         'health_status' => data_get($health, 'status'),
                         'agent_response_code' => $response->status(),
                         'agent_response' => $this->summarizeAgentResponse($response->json(), $response->body()),
-                        'result_prefix' => $this->makeResultPrefix($remoteTaskId, $agent),
+                        'result_prefix' => $this->makeDispatchResultPrefix($remoteTaskId, $agent, $dispatchAllClusters),
                     ];
 
                     $this->logInfo('Remote dispatch succeeded.', [
@@ -170,7 +179,7 @@ class TaskExecutionService
                         'tool' => $tool,
                         'remote_task_id' => $remoteTaskId,
                         'response_code' => $response->status(),
-                        'result_prefix' => $this->makeResultPrefix($remoteTaskId, $agent),
+                        'result_prefix' => $this->makeDispatchResultPrefix($remoteTaskId, $agent, $dispatchAllClusters),
                     ]);
                 } catch (\Illuminate\Http\Client\ConnectionException $connEx) {
                     // Timeout/connection error: agent may have already accepted the task.
@@ -200,12 +209,13 @@ class TaskExecutionService
                         'tool' => $tool,
                         'tool_label' => self::getAvailableTools()[$tool] ?? $tool,
                         'remote_task_id' => $remoteTaskId,
-                        'cluster_name' => $agent->cluster_name,
+                        'cluster_name' => $dispatchAllClusters ? '' : $agent->cluster_name,
+                        'cluster_scope' => $dispatchAllClusters ? 'all' : 'single',
                         'cluster_sort_key' => $this->makeClusterSortKey($agent),
                         'health_status' => data_get($health, 'status'),
                         'agent_response_code' => null,
                         'agent_response' => ['note' => 'Dispatch timed out; agent may still be processing.'],
-                        'result_prefix' => $this->makeResultPrefix($remoteTaskId, $agent),
+                        'result_prefix' => $this->makeDispatchResultPrefix($remoteTaskId, $agent, $dispatchAllClusters),
                         'dispatch_timed_out' => true,
                     ];
 
@@ -260,11 +270,11 @@ class TaskExecutionService
             $task->update([
                 'status' => SecurityTaskStatus::Running,
                 'progress' => 20,
-                'summary' => [
+                'summary' => array_merge($existingSummary, [
                     'dispatches' => $dispatched,
                     'dispatch_failures' => $failures,
-                ],
-                'last_message' => $this->makeDispatchMessage(count($dispatched), count($failures), $agent),
+                ]),
+                'last_message' => $this->makeDispatchMessage(count($dispatched), count($failures), $agent, $dispatchAllClusters),
             ]);
 
             $this->logInfo('Remote task dispatch finished.', [
@@ -304,12 +314,14 @@ class TaskExecutionService
     {
         $cacheKey = 'agent_health_' . md5($baseUrl . $agent->cluster_name);
         $cacheTtl = now()->endOfDay()->diffInSeconds(now()); // until midnight
+        $cacheStore = Cache::store('file');
 
-        $cached = \Illuminate\Support\Facades\Cache::get($cacheKey);
+        $cached = $cacheStore->get($cacheKey);
         if ($cached !== null) {
             $this->logInfo('Cluster health check served from cache.', [
                 'cluster_name' => $agent->cluster_name,
                 'cached_status' => $cached['status'] ?? 'unknown',
+                'cache_store' => 'file',
             ]);
 
             return $cached;
@@ -364,7 +376,18 @@ class TaskExecutionService
             'body' => $response->json() ?? ['body' => Str::limit($response->body(), 500)],
         ]);
 
-        return $response->json() ?? ['status' => 'ok'];
+        $payload = $response->json() ?? ['status' => 'ok'];
+
+        $cacheStore->put($cacheKey, $payload, now()->addSeconds($cacheTtl));
+
+        $this->logInfo('Stored cluster health check in cache.', [
+            'cluster_name' => $agent->cluster_name,
+            'cache_store' => 'file',
+            'cache_key' => $cacheKey,
+            'ttl_seconds' => $cacheTtl,
+        ]);
+
+        return $payload;
     }
 
     protected function dispatchTool(
@@ -374,19 +397,37 @@ class TaskExecutionService
         string $tool,
         string $remoteTaskId,
         array $parameters,
+        string|array $clusters,
     ): Response {
         $endpoint = $this->resolveToolEndpoint($tool);
 
         // Keep the agent request body strict: only clusters is mandatory, all other
         // fields are optional and sent only when they have a meaningful value.
         $payload = array_merge([
-            'clusters' => [(string) $agent->cluster_name],
+            'clusters' => $clusters,
         ], $parameters);
 
-        $response = Http::timeout($this->httpTimeout())
-            ->connectTimeout($this->httpConnectTimeout())
-            ->acceptJson()
-            ->post($baseUrl . $endpoint, $payload);
+        $response = $this->sendToolDispatchRequest($baseUrl, $endpoint, $payload);
+
+        if (
+            $response->status() === 422
+            && $clusters === 'all'
+        ) {
+            $fallbackPayload = array_merge($payload, [
+                'clusters' => ['all'],
+            ]);
+
+            $this->logWarning('Agent rejected `clusters: all`; retrying with array fallback.', [
+                'tool' => $tool,
+                'cluster_name' => $agent->cluster_name,
+                'remote_task_id' => $remoteTaskId,
+                'endpoint' => $endpoint,
+                'status_code' => $response->status(),
+                'body' => Str::limit($response->body(), 1000),
+            ]);
+
+            $response = $this->sendToolDispatchRequest($baseUrl, $endpoint, $fallbackPayload);
+        }
 
         if (! $response->successful()) {
             $this->logWarning('Agent API returned a non-success response during tool dispatch.', [
@@ -420,6 +461,14 @@ class TaskExecutionService
         }
 
         return $response;
+    }
+
+    protected function sendToolDispatchRequest(string $baseUrl, string $endpoint, array $payload): Response
+    {
+        return Http::timeout($this->httpTimeout())
+            ->connectTimeout($this->httpConnectTimeout())
+            ->acceptJson()
+            ->post($baseUrl . $endpoint, $payload);
     }
 
     protected function resolveToolEndpoint(string $tool): string
@@ -676,19 +725,30 @@ class TaskExecutionService
         return 'result/' . $remoteTaskId . '/' . $agent->cluster_name . '/';
     }
 
-    protected function makeDispatchMessage(int $successCount, int $failureCount, ClusterAgent $agent): string
+    protected function makeDispatchResultPrefix(string $remoteTaskId, ClusterAgent $agent, bool $dispatchAllClusters): string
     {
+        if ($dispatchAllClusters) {
+            return 'result/' . $remoteTaskId . '/';
+        }
+
+        return $this->makeResultPrefix($remoteTaskId, $agent);
+    }
+
+    protected function makeDispatchMessage(int $successCount, int $failureCount, ClusterAgent $agent, bool $dispatchAllClusters = false): string
+    {
+        $clusterLabel = $dispatchAllClusters ? 'all active clusters' : 'cluster [' . $agent->cluster_name . ']';
+
         return $failureCount > 0
             ? sprintf(
-                'Dispatched %d tool(s) to cluster [%s]. %d tool dispatch(es) still need attention.',
+                'Dispatched %d tool(s) to %s. %d tool dispatch(es) still need attention.',
                 $successCount,
-                $agent->cluster_name,
+                $clusterLabel,
                 $failureCount,
             )
             : sprintf(
-                'Dispatched %d tool(s) to cluster [%s]. Agent results are expected in S3 and DynamoDB shortly.',
+                'Dispatched %d tool(s) to %s. Agent results are expected in S3 and DynamoDB shortly.',
                 $successCount,
-                $agent->cluster_name,
+                $clusterLabel,
             );
     }
 

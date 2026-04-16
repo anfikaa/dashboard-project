@@ -11,6 +11,8 @@ use Aws\DynamoDb\DynamoDbClient;
 use Aws\DynamoDb\Marshaler;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Throwable;
@@ -21,13 +23,38 @@ class SecurityTaskSyncService
         protected ScanService $scanService,
     ) {}
 
+    public function autoSyncForUi(int $recentLimit = 20, int $completedLimit = 10): array
+    {
+        $cooldown = max(5, (int) env('SECURITY_TASK_UI_SYNC_COOLDOWN_SECONDS', 15));
+        $cacheKey = 'security-tasks.ui-auto-sync.' . md5(json_encode([
+            'recent_limit' => $recentLimit,
+            'completed_limit' => $completedLimit,
+        ]));
+
+        if (Cache::has($cacheKey)) {
+            return [
+                'skipped' => true,
+                'recent_synced' => 0,
+                'completed_ingested' => 0,
+            ];
+        }
+
+        Cache::put($cacheKey, now()->toIso8601String(), now()->addSeconds($cooldown));
+
+        return [
+            'skipped' => false,
+            'recent_synced' => $this->syncRecentTasks($recentLimit),
+            'completed_ingested' => $this->syncRecentCompletedTasksMissingResults($completedLimit),
+        ];
+    }
+
     public function syncRecentTasks(int $limit = 20): int
     {
         $this->logInfo('Refreshing recent remote tasks.', [
             'limit' => $limit,
         ]);
 
-        $taskIds = SecurityTask::query()
+        $taskIds = DB::table('security_tasks')
             ->whereNotNull('summary')
             ->whereIn('status', [
                 SecurityTaskStatus::Pending->value,
@@ -38,11 +65,7 @@ class SecurityTaskSyncService
             ->pluck('id');
 
         foreach ($taskIds as $taskId) {
-            $task = SecurityTask::query()->find($taskId);
-
-            if ($task) {
-                $this->syncTask($task);
-            }
+            $this->syncTaskById((int) $taskId);
         }
 
         return $taskIds->count();
@@ -50,24 +73,20 @@ class SecurityTaskSyncService
 
     public function syncRecentCompletedTasksMissingResults(int $limit = 10): int
     {
-        $taskIds = SecurityTask::query()
+        $tasks = DB::table('security_tasks')
+            ->select(['id', 'summary'])
             ->where('status', SecurityTaskStatus::Completed->value)
             ->whereNotNull('summary')
             ->latest('completed_at')
             ->latest('updated_at')
             ->limit($limit)
-            ->pluck('id');
+            ->get();
 
         $count = 0;
 
-        foreach ($taskIds as $taskId) {
-            $task = SecurityTask::query()->find($taskId);
-
-            if (! $task) {
-                continue;
-            }
-
-            $dispatches = collect(data_get($task->summary, 'dispatches', []));
+        foreach ($tasks as $task) {
+            $summary = $this->decodeSummaryPayload($task->summary ?? null);
+            $dispatches = collect($summary['dispatches'] ?? []);
             $needsImport = $dispatches->contains(function ($dispatch): bool {
                 if (! is_array($dispatch)) {
                     return false;
@@ -81,7 +100,7 @@ class SecurityTaskSyncService
                 continue;
             }
 
-            $this->syncTask($task);
+            $this->syncTaskById((int) $task->id);
             $count++;
         }
 
@@ -90,16 +109,38 @@ class SecurityTaskSyncService
 
     public function syncTask(SecurityTask $task): void
     {
+        $this->syncTaskById((int) $task->getKey());
+    }
+
+    protected function syncTaskById(int $taskId): void
+    {
         $task = SecurityTask::query()
+            ->select([
+                'id',
+                'task_id',
+                'title',
+                'cluster_agent_id',
+                'status',
+                'progress',
+                'notes',
+                'last_message',
+                'submitted_by',
+                'started_at',
+                'completed_at',
+                'created_at',
+                'updated_at',
+            ])
             ->with('clusterAgent')
-            ->findOrFail($task->getKey());
+            ->findOrFail($taskId);
+
+        $summaryPayload = $this->getTaskSummaryPayload($taskId);
 
         $this->logInfo('Starting remote task sync.', [
             'task_id' => $task->task_id,
             'security_task_id' => $task->id,
         ]);
 
-        $dispatches = collect(data_get($task->summary, 'dispatches', []))
+        $dispatches = collect($summaryPayload['dispatches'] ?? [])
             ->map(fn (array $dispatch): array => $this->sanitizeDispatchForStorage($dispatch))
             ->filter(fn (array $dispatch): bool => filled($dispatch['remote_task_id'] ?? null))
             ->values();
@@ -132,14 +173,12 @@ class SecurityTaskSyncService
             }
         }
 
-        $failures = collect(data_get($task->summary, 'dispatch_failures', []))
+        $failures = collect($summaryPayload['dispatch_failures'] ?? [])
             ->filter(fn ($entry): bool => is_string($entry) && filled($entry))
             ->values()
             ->all();
 
-        $task->refresh();
-        $this->updateTaskState($task, collect($syncedDispatches), $failures);
-        $task->refresh();
+        $this->updateTaskState($task, collect($syncedDispatches), $failures, $summaryPayload);
     }
 
     protected function syncDispatch(SecurityTask $task, ?ClusterAgent $clusterAgent, array $dispatch): array
@@ -177,7 +216,7 @@ class SecurityTaskSyncService
         $resultPrefix = rtrim((string) ($dispatch['result_prefix'] ?? ''), '/');
 
         $files = $resultPrefix !== '' && filled($tool)
-            ? $this->scanService->getS3ResultFilesForTool($resultPrefix, $tool)
+            ? $this->scanService->getS3ResultFilesForTool($resultPrefix, $tool, $clusterName)
             : collect();
 
         // Fallback: If agent failed to update DynamoDB to COMPLETED but S3 files exist, override to COMPLETED
@@ -359,7 +398,7 @@ class SecurityTaskSyncService
         ];
     }
 
-    protected function updateTaskState(SecurityTask $task, Collection $dispatches, array $dispatchFailures): void
+    protected function updateTaskState(SecurityTask $task, Collection $dispatches, array $dispatchFailures, array $existingSummary = []): void
     {
         $total = max(1, $dispatches->count());
         $terminalDispatches = $dispatches
@@ -443,7 +482,7 @@ class SecurityTaskSyncService
             ],
         };
 
-        $summary = $task->summary ?? [];
+        $summary = $existingSummary;
         $summary['dispatches'] = $dispatches
             ->map(fn (array $dispatch): array => $this->sanitizeDispatchForStorage($dispatch))
             ->values()
@@ -472,6 +511,30 @@ class SecurityTaskSyncService
             'progress' => $status === SecurityTaskStatus::Completed || $status === SecurityTaskStatus::Failed ? 100 : $progress,
             'remote_totals' => $summary['remote_totals'] ?? [],
         ]);
+    }
+
+    protected function getTaskSummaryPayload(int $taskId): array
+    {
+        $summary = DB::table('security_tasks')
+            ->where('id', $taskId)
+            ->value('summary');
+
+        return $this->decodeSummaryPayload($summary);
+    }
+
+    protected function decodeSummaryPayload(mixed $summary): array
+    {
+        if (is_array($summary)) {
+            return $summary;
+        }
+
+        if (! is_string($summary) || trim($summary) === '') {
+            return [];
+        }
+
+        $decoded = json_decode($summary, true);
+
+        return is_array($decoded) ? $decoded : [];
     }
 
     protected function resolveTerminalStatus(array $dispatch): string

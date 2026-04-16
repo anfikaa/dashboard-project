@@ -37,7 +37,8 @@ class SecurityTaskResource extends Resource
                 ->maxLength(255),
             Select::make('cluster_agent_id')
                 ->label('Clusters')
-                ->options(fn (): array => ClusterAgent::query()
+                ->options(fn (): array => ['all' => 'All active clusters'] + ClusterAgent::query()
+                    ->remoteBacked()
                     ->active()
                     ->orderBy('name')
                     ->get()
@@ -51,13 +52,20 @@ class SecurityTaskResource extends Resource
                 ->preload()
                 ->live()
                 ->required()
-                ->helperText('The selected cluster value will be sent to the agent API as the `clusters` field.'),
+                ->helperText('Choose one cluster or `All active clusters` to submit the same scan to every active cluster agent.'),
             Select::make('tools')
                 ->label('Security Tools')
-                ->multiple()
                 ->options(function (Get $get): array {
-                    $agent = ClusterAgent::query()->find($get('cluster_agent_id'));
                     $supportedTools = TaskExecutionService::getAvailableTools();
+                    $clusterAgentId = $get('cluster_agent_id');
+
+                    if ($clusterAgentId === 'all') {
+                        return $supportedTools;
+                    }
+
+                    $agent = ClusterAgent::query()
+                        ->remoteBacked()
+                        ->find($clusterAgentId);
 
                     if (! $agent) {
                         return $supportedTools;
@@ -87,7 +95,7 @@ class SecurityTaskResource extends Resource
                 ->searchable()
                 ->preload()
                 ->required()
-                ->helperText('Choose one or more tools that this selected agent can execute.'),
+                ->helperText('Choose exactly one tool to run for the selected cluster scope.'),
             Textarea::make('notes')
                 ->rows(4)
                 ->placeholder('Optional execution notes, scope, or investigation context.'),
@@ -97,6 +105,19 @@ class SecurityTaskResource extends Resource
     public static function table(Table $table): Table
     {
         return $table
+            ->modifyQueryUsing(fn ($query) => $query->select([
+                'id',
+                'task_id',
+                'title',
+                'cluster_agent_id',
+                'tools',
+                'status',
+                'progress',
+                'last_message',
+                'created_at',
+                'updated_at',
+                'completed_at',
+            ]))
             ->defaultSort('created_at', 'desc')
             ->poll('10s')
             ->columns([
@@ -144,6 +165,7 @@ class SecurityTaskResource extends Resource
                 Tables\Filters\SelectFilter::make('cluster_agent_id')
                     ->label('Clusters')
                     ->options(fn (): array => ClusterAgent::query()
+                        ->remoteBacked()
                         ->orderBy('cluster_name')
                         ->get()
                         ->mapWithKeys(fn (ClusterAgent $agent): array => [
@@ -160,7 +182,6 @@ class SecurityTaskResource extends Resource
                     ->color('gray')
                     ->action(function (SecurityTask $record): void {
                         app(SecurityTaskSyncService::class)->syncTask($record);
-                        $record->refresh();
                     })
                     ->successNotificationTitle('Remote task status refreshed.'),
                 Action::make('run')

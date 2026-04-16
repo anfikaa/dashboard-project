@@ -6,10 +6,13 @@ use App\Filament\Resources\ClusterAgentResource\Pages;
 use App\Models\ClusterAgent;
 use App\Services\DynamoDbClusterAgentService;
 use Filament\Actions\Action;
+use Filament\Notifications\Notification;
 use Filament\Resources\Resource;
 use Filament\Schemas\Schema;
 use Filament\Tables;
 use Filament\Tables\Table;
+use Illuminate\Database\Eloquent\Builder;
+use Throwable;
 
 class ClusterAgentResource extends Resource
 {
@@ -24,6 +27,12 @@ class ClusterAgentResource extends Resource
         return $schema->components([]);
     }
 
+    public static function getEloquentQuery(): Builder
+    {
+        return parent::getEloquentQuery()
+            ->remoteBacked();
+    }
+
     public static function table(Table $table): Table
     {
         return $table
@@ -33,8 +42,25 @@ class ClusterAgentResource extends Resource
                 Action::make('syncAgents')
                     ->label('Sync Agents')
                     ->icon('heroicon-o-arrow-path')
-                    ->action(fn (): int => app(DynamoDbClusterAgentService::class)->syncToDatabase(true))
-                    ->successNotificationTitle('Cluster agents synced.'),
+                    ->action(function (): void {
+                        try {
+                            $count = app(DynamoDbClusterAgentService::class)->syncToDatabase(true);
+
+                            Notification::make()
+                                ->title('Cluster agents synced.')
+                                ->body(sprintf('%d agent(s) loaded from DynamoDB.', $count))
+                                ->success()
+                                ->send();
+                        } catch (Throwable $exception) {
+                            report($exception);
+
+                            Notification::make()
+                                ->title('Unable to sync cluster agents from DynamoDB.')
+                                ->body('Please check the DynamoDB access policy or AWS credentials for this app.')
+                                ->danger()
+                                ->send();
+                        }
+                    })
             ])
             ->columns([
                 Tables\Columns\TextColumn::make('cluster_name')

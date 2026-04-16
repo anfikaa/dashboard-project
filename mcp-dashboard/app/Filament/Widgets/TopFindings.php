@@ -35,6 +35,16 @@ class TopFindings extends TableWidget
                 Tables\Columns\TextColumn::make('scan_id')
                     ->label('Scan ID')
                     ->searchable()
+                    ->wrap()
+                    ->tooltip(fn (array $record): ?string => filled($record['local_task_id'] ?? null) ? 'Local Task ID: ' . $record['local_task_id'] : null)
+                    ->extraHeaderAttributes(['style' => 'width: 18rem;'])
+                    ->extraAttributes(['style' => 'width: 18rem; min-width: 18rem; max-width: 18rem; white-space: normal; overflow-wrap: anywhere; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; vertical-align: top;']),
+
+                Tables\Columns\TextColumn::make('local_task_id')
+                    ->label('Task Ref')
+                    ->toggleable()
+                    ->placeholder('-')
+                    ->tooltip(fn ($state): ?string => filled($state) ? 'Local Laravel task reference' : null)
                     ->extraHeaderAttributes(['style' => 'width: 11rem;'])
                     ->extraAttributes(['style' => 'width: 11rem; min-width: 11rem;']),
 

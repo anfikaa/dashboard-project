@@ -22,11 +22,13 @@ class ListSecurityTasks extends ListRecords
                 ->icon('heroicon-o-arrow-path')
                 ->action(function (): void {
                     try {
-                        $count = app(SecurityTaskSyncService::class)->syncRecentTasks();
+                        $service = app(SecurityTaskSyncService::class);
+                        $count = $service->syncRecentTasks();
+                        $imported = $service->syncRecentCompletedTasksMissingResults();
 
                         Notification::make()
                             ->title('Remote task status refreshed.')
-                            ->body("Synced {$count} recent task(s).")
+                            ->body("Synced {$count} recent task(s) and ingested {$imported} completed task result set(s).")
                             ->success()
                             ->send();
                     } catch (Throwable $exception) {

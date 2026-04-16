@@ -2,6 +2,9 @@
 
 namespace App\Services;
 
+use App\Support\AwsCredentialFactory;
+use Aws\DynamoDb\DynamoDbClient;
+use Aws\DynamoDb\Marshaler;
 use App\Models\SecurityTask;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
@@ -20,6 +23,42 @@ class ScanService
     protected array $prefixFileCache = [];
 
     protected bool $s3UnavailableForRequest = false;
+
+    protected array $remoteTaskStatusCache = [];
+
+    public function getToolResultSummaries(array $tools): Collection
+    {
+        $requestedTools = collect($tools)
+            ->filter()
+            ->map(fn (string $tool): ?string => $this->normalizeToolName($tool))
+            ->filter()
+            ->unique()
+            ->values();
+
+        if ($requestedTools->isEmpty()) {
+            return collect();
+        }
+
+        return $this->getRecentS3FilesByTool(env('SCAN_S3_DISK', 's3'), $requestedTools)
+            ->map(function (array $file): array {
+                try {
+                    $findings = $this->parseFile($file);
+
+                    if ($findings->isNotEmpty()) {
+                        return $this->summarizeToolFindings($findings, $file);
+                    }
+
+                    return $this->makeMissingResultRecord($file);
+                } catch (\Throwable $exception) {
+                    if ($this->isS3MissingFileException($exception)) {
+                        return $this->makeMissingResultRecord($file);
+                    }
+
+                    return $this->makeParseErrorRecord($file, $exception);
+                }
+            })
+            ->values();
+    }
 
     public function getAvailableSampleFiles(?array $tools = null): Collection
     {
@@ -119,7 +158,7 @@ class ScanService
         );
     }
 
-    public function getS3ResultFilesForTool(string $prefix, string $tool): Collection
+    public function getS3ResultFilesForTool(string $prefix, string $tool, ?string $clusterName = null): Collection
     {
         $disk = env('SCAN_S3_DISK', 's3');
         $normalizedTool = $this->normalizeToolName($tool);
@@ -128,7 +167,7 @@ class ScanService
             return collect();
         }
 
-        $paths = $this->candidateS3ResultPaths($prefix, $normalizedTool);
+        $paths = $this->candidateS3ResultPaths($prefix, $normalizedTool, $clusterName);
 
         return collect([[
             'tool' => $normalizedTool,
@@ -138,6 +177,7 @@ class ScanService
             'last_modified' => 0,
             'fallback_paths' => array_slice($paths, 1),
             'prefix' => rtrim($prefix, '/'),
+            'cluster_name' => $clusterName,
         ]]);
     }
 
@@ -152,7 +192,7 @@ class ScanService
                     return null;
                 }
 
-                $paths = $this->candidateS3ResultPaths($resultPrefix, $tool);
+                $paths = $this->candidateS3ResultPaths($resultPrefix, $tool, $dispatch['cluster_name'] ?? null);
 
                 return [
                     'tool' => $tool,
@@ -162,6 +202,15 @@ class ScanService
                     'last_modified' => (int) ($dispatch['completed_at'] ?? 0),
                     'fallback_paths' => array_slice($paths, 1),
                     'prefix' => $resultPrefix,
+                    'scan_id' => $this->resolveRemoteScanId(
+                        resultPrefix: $resultPrefix,
+                        remoteTaskId: $dispatch['remote_task_id'] ?? null,
+                        fallbackScanId: $dispatch['scan_id'] ?? null,
+                    ),
+                    'local_task_id' => $dispatch['local_task_id'] ?? null,
+                    'remote_task_id' => $dispatch['remote_task_id'] ?? null,
+                    'cluster_name' => $dispatch['cluster_name'] ?? null,
+                    'remote_status' => $dispatch['remote_status'] ?? null,
                 ];
             })
             ->filter()
@@ -170,12 +219,182 @@ class ScanService
 
     protected function getRecentResultPrefixesByTool(Collection $requestedTools): Collection
     {
-        $maxTasks = max(10, (int) env('SCAN_S3_TASK_LOOKBACK', 50));
         $perToolCandidates = max(1, (int) env('SCAN_S3_PREFIX_CANDIDATES_PER_TOOL', 5));
+        $terminalRemoteTasks = $this->getRecentTerminalRemoteTasksByTool($requestedTools);
+        $localDispatchIndex = $this->getRecentLocalDispatchIndex();
+        $dispatches = $terminalRemoteTasks
+            ->map(function (array $remoteTask) use ($localDispatchIndex): ?array {
+                $remoteTaskId = (string) ($remoteTask['remote_task_id'] ?? '');
+                $localDispatch = $localDispatchIndex->get($remoteTaskId);
+
+                if (! is_array($localDispatch) || blank($localDispatch['result_prefix'] ?? null)) {
+                    return null;
+                }
+
+                return [
+                    'tool' => $remoteTask['tool'] ?? $localDispatch['tool'] ?? null,
+                    'result_prefix' => (string) ($localDispatch['result_prefix'] ?? ''),
+                    'cluster_name' => (string) ($localDispatch['cluster_name'] ?? ''),
+                    'remote_status' => Str::upper((string) ($remoteTask['remote_status'] ?? '')),
+                    'scan_id' => $this->resolveRemoteScanId(
+                        resultPrefix: (string) ($localDispatch['result_prefix'] ?? ''),
+                        remoteTaskId: $remoteTaskId,
+                        fallbackScanId: $localDispatch['local_task_id'] ?? null,
+                    ),
+                    'local_task_id' => (string) ($localDispatch['local_task_id'] ?? ''),
+                    'remote_task_id' => $remoteTaskId,
+                    'completed_at' => (int) ($remoteTask['completed_at'] ?? 0),
+                    'task_id' => $localDispatch['task_id'] ?? null,
+                ];
+            })
+            ->filter();
+
+        if ($dispatches->isEmpty()) {
+            Log::warning('Falling back to local completed task dispatches for dashboard S3 candidates because terminal DynamoDB META records were unavailable.', [
+                'requested_tools' => $requestedTools->values()->all(),
+            ]);
+
+            $dispatches = $this->getFallbackLocalDashboardDispatches($requestedTools);
+        }
+
+        return $dispatches
+            ->filter(function (?array $dispatch) use ($requestedTools): bool {
+                if (! is_array($dispatch)) {
+                    return false;
+                }
+
+                $remoteStatus = Str::upper((string) ($dispatch['remote_status'] ?? ''));
+
+                return filled($dispatch['tool'])
+                    && filled($dispatch['result_prefix'])
+                    && in_array($remoteStatus, ['COMPLETED', 'FAILED'], true)
+                    && $requestedTools->contains($dispatch['tool']);
+            })
+            ->sortByDesc(fn (array $dispatch): int => (int) ($dispatch['completed_at'] ?? 0))
+            ->groupBy('tool')
+            ->flatMap(fn (Collection $group): Collection => $group->take($perToolCandidates))
+            ->values();
+    }
+
+    protected function getFallbackLocalDashboardDispatches(Collection $requestedTools): Collection
+    {
+        return $this->getRecentLocalDispatchIndex()
+            ->values()
+            ->filter(function (array $dispatch) use ($requestedTools): bool {
+                $tool = (string) ($dispatch['tool'] ?? '');
+                $taskStatus = Str::upper((string) ($dispatch['task_status'] ?? ''));
+                $remoteStatus = Str::upper((string) ($dispatch['remote_status'] ?? ''));
+
+                return $requestedTools->contains($tool)
+                    && filled($dispatch['result_prefix'] ?? null)
+                    && in_array($taskStatus, ['COMPLETED', 'FAILED'], true)
+                    && in_array($remoteStatus, ['COMPLETED', 'FAILED'], true);
+            })
+            ->map(function (array $dispatch): array {
+                return [
+                    'tool' => $dispatch['tool'] ?? null,
+                    'result_prefix' => (string) ($dispatch['result_prefix'] ?? ''),
+                    'cluster_name' => (string) ($dispatch['cluster_name'] ?? ''),
+                    'remote_status' => Str::upper((string) ($dispatch['remote_status'] ?? '')),
+                    'scan_id' => $this->resolveRemoteScanId(
+                        resultPrefix: (string) ($dispatch['result_prefix'] ?? ''),
+                        remoteTaskId: $dispatch['remote_task_id'] ?? null,
+                        fallbackScanId: $dispatch['local_task_id'] ?? null,
+                    ),
+                    'local_task_id' => (string) ($dispatch['local_task_id'] ?? ''),
+                    'remote_task_id' => (string) ($dispatch['remote_task_id'] ?? ''),
+                    'completed_at' => (int) ($dispatch['completed_at'] ?? 0),
+                    'task_id' => $dispatch['task_id'] ?? null,
+                ];
+            })
+            ->values();
+    }
+
+    protected function getRecentTerminalRemoteTasksByTool(Collection $requestedTools): Collection
+    {
+        $cacheKey = 'scan-service.terminal-remote-tasks.' . md5(json_encode([
+            'tools' => $requestedTools->values()->all(),
+            'table' => $this->securityTasksDynamoTableName(),
+        ]));
+
+        $ttl = max(10, (int) env('SCAN_REMOTE_STATUS_CACHE_TTL_SECONDS', 30));
+
+        return collect(Cache::remember($cacheKey, now()->addSeconds($ttl), function () use ($requestedTools): array {
+            try {
+                $client = $this->makeDynamoDbClient();
+                $marshaler = new Marshaler();
+                $records = [];
+                $exclusiveStartKey = null;
+                $pagesRemaining = max(1, (int) env('SCAN_DYNAMODB_META_SCAN_PAGES', 5));
+
+                do {
+                    $params = [
+                        'TableName' => $this->securityTasksDynamoTableName(),
+                        'FilterExpression' => 'SK = :meta AND #status IN (:completed, :failed)',
+                        'ExpressionAttributeNames' => [
+                            '#status' => 'status',
+                        ],
+                        'ExpressionAttributeValues' => [
+                            ':meta' => ['S' => 'META'],
+                            ':completed' => ['S' => 'COMPLETED'],
+                            ':failed' => ['S' => 'FAILED'],
+                        ],
+                    ];
+
+                    if ($exclusiveStartKey !== null) {
+                        $params['ExclusiveStartKey'] = $exclusiveStartKey;
+                    }
+
+                    $result = $client->scan($params);
+
+                    foreach ($result['Items'] ?? [] as $item) {
+                        $record = $marshaler->unmarshalItem($item);
+                        $tool = $this->normalizeToolName((string) ($record['tool'] ?? ''));
+                        $status = Str::upper((string) ($record['status'] ?? ''));
+
+                        if (! $requestedTools->contains($tool) || ! in_array($status, ['COMPLETED', 'FAILED'], true)) {
+                            continue;
+                        }
+
+                        $records[] = [
+                            'remote_task_id' => (string) ($record['PK'] ?? ''),
+                            'tool' => $tool,
+                            'remote_status' => $status,
+                            'completed_at' => $this->normalizeTimestamp($record['updated_at'] ?? null)
+                                ?? $this->normalizeTimestamp($record['created_at'] ?? null)
+                                ?? 0,
+                        ];
+                    }
+
+                    $exclusiveStartKey = $result['LastEvaluatedKey'] ?? null;
+                    $pagesRemaining--;
+                } while ($exclusiveStartKey !== null && $pagesRemaining > 0);
+
+                return collect($records)
+                    ->filter(fn (array $record): bool => filled($record['remote_task_id']))
+                    ->sortByDesc(fn (array $record): int => (int) ($record['completed_at'] ?? 0))
+                    ->groupBy('tool')
+                    ->flatMap(fn (Collection $group): Collection => $group->unique('remote_task_id')->values())
+                    ->values()
+                    ->all();
+            } catch (\Throwable $exception) {
+                Log::warning('Unable to scan terminal META items from DynamoDB for dashboard.', [
+                    'table' => $this->securityTasksDynamoTableName(),
+                    'error' => $exception->getMessage(),
+                ]);
+
+                return [];
+            }
+        }));
+    }
+
+    protected function getRecentLocalDispatchIndex(): Collection
+    {
+        $maxTasks = max(10, (int) env('SCAN_S3_TASK_LOOKBACK', 50));
 
         return collect(
             DB::table('security_tasks')
-                ->select(['id', 'summary', 'completed_at', 'updated_at'])
+                ->select(['id', 'task_id', 'status', 'summary', 'completed_at', 'updated_at'])
                 ->whereNotNull('summary')
                 ->orderByDesc('completed_at')
                 ->orderByDesc('updated_at')
@@ -191,27 +410,27 @@ class ScanService
                 }
 
                 return collect($summary['dispatches'] ?? [])
-                    ->filter(fn (mixed $dispatch): bool => is_array($dispatch))
+                    ->filter(fn (mixed $dispatch): bool => is_array($dispatch) && filled($dispatch['remote_task_id'] ?? null))
                     ->map(function (array $dispatch) use ($task): array {
                         return [
+                            'remote_task_id' => (string) ($dispatch['remote_task_id'] ?? ''),
                             'tool' => $this->normalizeToolName((string) ($dispatch['tool'] ?? '')),
                             'result_prefix' => (string) ($dispatch['result_prefix'] ?? ''),
+                            'cluster_name' => (string) ($dispatch['cluster_name'] ?? ''),
+                            'remote_status' => Str::upper((string) ($dispatch['remote_status'] ?? '')),
+                            'dynamodb_meta_status' => Str::upper((string) ($dispatch['dynamodb_meta_status'] ?? '')),
+                            'task_status' => Str::upper((string) ($task->status ?? '')),
+                            'local_task_id' => (string) ($task->task_id ?? ''),
+                            'task_id' => $task->id,
                             'completed_at' => $this->normalizeTimestamp($task->completed_at ?? null)
                                 ?? $this->normalizeTimestamp($task->updated_at ?? null)
                                 ?? 0,
-                            'task_id' => $task->id,
                         ];
                     });
             })
-            ->filter(function (array $dispatch) use ($requestedTools): bool {
-                return filled($dispatch['tool'])
-                    && filled($dispatch['result_prefix'])
-                    && $requestedTools->contains($dispatch['tool']);
-            })
             ->sortByDesc(fn (array $dispatch): int => (int) ($dispatch['completed_at'] ?? 0))
-            ->groupBy('tool')
-            ->flatMap(fn (Collection $group): Collection => $group->take($perToolCandidates))
-            ->values();
+            ->unique('remote_task_id')
+            ->keyBy('remote_task_id');
     }
 
     protected function normalizeTimestamp(mixed $value): ?int
@@ -229,6 +448,112 @@ class ScanService
         }
 
         return null;
+    }
+
+    protected function resolveDashboardRemoteStatus(array $dispatch): string
+    {
+        $cachedMetaStatus = Str::upper((string) ($dispatch['dynamodb_meta_status'] ?? ''));
+        $remoteTaskId = trim((string) ($dispatch['remote_task_id'] ?? ''));
+
+        if ($remoteTaskId !== '') {
+            $liveStatus = $this->fetchRemoteTaskMetaStatus($remoteTaskId);
+
+            if (in_array($liveStatus, ['COMPLETED', 'FAILED'], true)) {
+                return $liveStatus;
+            }
+        }
+
+        if (in_array($cachedMetaStatus, ['COMPLETED', 'FAILED'], true)) {
+            return $cachedMetaStatus;
+        }
+
+        return '';
+    }
+
+    protected function fetchRemoteTaskMetaStatus(string $remoteTaskId): ?string
+    {
+        if (array_key_exists($remoteTaskId, $this->remoteTaskStatusCache)) {
+            return $this->remoteTaskStatusCache[$remoteTaskId];
+        }
+
+        $cacheKey = 'scan-service.remote-meta-status.' . $remoteTaskId;
+
+        $status = Cache::remember($cacheKey, now()->addSeconds(max(10, (int) env('SCAN_REMOTE_STATUS_CACHE_TTL_SECONDS', 30))), function () use ($remoteTaskId): ?string {
+            try {
+                $client = $this->makeDynamoDbClient();
+                $result = $client->getItem([
+                    'TableName' => $this->securityTasksDynamoTableName(),
+                    'Key' => [
+                        'PK' => ['S' => $remoteTaskId],
+                        'SK' => ['S' => 'META'],
+                    ],
+                    'ConsistentRead' => true,
+                ]);
+
+                $item = $result['Item'] ?? null;
+
+                if (! is_array($item)) {
+                    return null;
+                }
+
+                $record = (new Marshaler())->unmarshalItem($item);
+                $status = Str::upper((string) ($record['status'] ?? $record['STATUS'] ?? $record['Status'] ?? ''));
+
+                return $status !== '' ? $status : null;
+            } catch (\Throwable $exception) {
+                Log::warning('Unable to fetch live DynamoDB META status for dashboard scan.', [
+                    'remote_task_id' => $remoteTaskId,
+                    'error' => $exception->getMessage(),
+                ]);
+
+                return null;
+            }
+        });
+
+        return $this->remoteTaskStatusCache[$remoteTaskId] = is_string($status) && $status !== '' ? $status : null;
+    }
+
+    protected function makeDynamoDbClient(): DynamoDbClient
+    {
+        $config = [
+            'version' => 'latest',
+            'region' => env('AWS_DYNAMODB_REGION', env('AWS_DEFAULT_REGION')),
+            'retries' => max(0, (int) env('AWS_DYNAMODB_RETRIES', 0)),
+            'http' => [
+                'connect_timeout' => max(1, (int) env('AWS_DYNAMODB_CONNECT_TIMEOUT', 1)),
+                'timeout' => max(1, (int) env('AWS_DYNAMODB_TIMEOUT', 2)),
+            ],
+        ];
+
+        if (filled(env('AWS_DYNAMODB_ENDPOINT'))) {
+            $config['endpoint'] = env('AWS_DYNAMODB_ENDPOINT');
+        }
+
+        return new DynamoDbClient(AwsCredentialFactory::applyToConfig($config));
+    }
+
+    protected function securityTasksDynamoTableName(): string
+    {
+        return (string) env('SECURITY_TASKS_DYNAMODB_TABLE', 'intern-tasks');
+    }
+
+    protected function resolveRemoteScanId(string $resultPrefix, mixed $remoteTaskId = null, mixed $fallbackScanId = null): string
+    {
+        $remoteTaskId = is_scalar($remoteTaskId) ? trim((string) $remoteTaskId) : '';
+
+        if ($remoteTaskId !== '') {
+            return $remoteTaskId;
+        }
+
+        $segments = array_values(array_filter(explode('/', trim($resultPrefix, '/'))));
+
+        if (count($segments) >= 2 && ($segments[0] ?? null) === 'result' && filled($segments[1] ?? null)) {
+            return (string) $segments[1];
+        }
+
+        return is_scalar($fallbackScanId) && trim((string) $fallbackScanId) !== ''
+            ? trim((string) $fallbackScanId)
+            : 'unknown-task';
     }
 
     public function parseFile(array $file): Collection
@@ -267,11 +592,11 @@ class ScanService
                     return collect();
                 }
 
-                if (Str::contains($exception->getMessage(), 'Unable to read file from location')) {
+                if ($this->isS3MissingFileException($exception)) {
                     continue;
                 }
 
-                if (! Str::contains($exception->getMessage(), 'Unable to read file from location')) {
+                if (! $this->isS3MissingFileException($exception)) {
                     throw $exception;
                 }
             }
@@ -300,6 +625,10 @@ class ScanService
                         return collect();
                     }
 
+                    if ($this->isS3MissingFileException($exception)) {
+                        return collect();
+                    }
+
                     throw $exception;
                 }
             }
@@ -312,10 +641,11 @@ class ScanService
         return collect();
     }
 
-    protected function candidateS3ResultPaths(string $prefix, string $tool): array
+    protected function candidateS3ResultPaths(string $prefix, string $tool, ?string $clusterName = null): array
     {
         $prefix = rtrim($prefix, '/');
         $tool = $this->normalizeToolName($tool) ?? $tool;
+        $clusterName = is_string($clusterName) ? trim($clusterName) : '';
 
         $candidates = match ($tool) {
             'kubebench' => ['result-kubebench.json', 'result-kube-bench.json', 'result-kube_bench.json', 'result.json'],
@@ -327,10 +657,19 @@ class ScanService
         };
 
         $prefixes = [$prefix];
+
+        if ($clusterName !== '' && ! Str::endsWith($prefix, '/' . $clusterName) && basename($prefix) !== $clusterName) {
+            $prefixes[] = $prefix . '/' . $clusterName;
+        }
+
         $parentPrefix = preg_replace('#/[^/]+$#', '', $prefix);
 
         if (is_string($parentPrefix) && $parentPrefix !== '' && $parentPrefix !== $prefix) {
             $prefixes[] = $parentPrefix;
+
+            if ($clusterName !== '' && ! Str::endsWith($parentPrefix, '/' . $clusterName) && basename($parentPrefix) !== $clusterName) {
+                $prefixes[] = $parentPrefix . '/' . $clusterName;
+            }
         }
 
         $paths = [];
@@ -342,6 +681,105 @@ class ScanService
         }
 
         return array_values(array_unique($paths));
+    }
+
+    protected function summarizeToolFindings(Collection $findings, array $file): array
+    {
+        $counts = $this->summarize($findings);
+        $primary = $findings
+            ->sortByDesc(fn (array $finding): int => $this->severityRank((string) ($finding['status_bucket'] ?? 'WARN')))
+            ->first() ?? [];
+        $statusBucket = $counts['FAIL'] > 0 ? 'FAIL' : ($counts['WARN'] > 0 ? 'WARN' : 'PASS');
+        $summary = collect([
+            $counts['FAIL'] > 0 ? "{$counts['FAIL']} fail" . ($counts['FAIL'] > 1 ? 's' : '') : null,
+            $counts['WARN'] > 0 ? "{$counts['WARN']} warning" . ($counts['WARN'] > 1 ? 's' : '') : null,
+            $counts['PASS'] > 0 ? "{$counts['PASS']} pass" . ($counts['PASS'] > 1 ? 'es' : '') : null,
+        ])->filter()->implode(', ');
+
+        return [
+            'tool' => (string) ($primary['tool'] ?? $file['tool'] ?? 'unknown'),
+            'scan_id' => (string) ($file['remote_task_id'] ?? $primary['scan_id'] ?? $file['scan_id'] ?? 'unknown-task'),
+            'scan_status' => Str::upper((string) ($file['remote_status'] ?? $primary['scan_status'] ?? 'COMPLETED')),
+            'cluster_name' => (string) ($primary['cluster_name'] ?? $file['cluster_name'] ?? 'Unknown cluster'),
+            'scanned_at' => $primary['scanned_at'] ?? Carbon::createFromTimestamp((int) ($file['last_modified'] ?? time())),
+            'status_bucket' => $statusBucket,
+            'description' => trim(implode(' ', array_filter([
+                $summary !== '' ? 'Summary: ' . $summary . '.' : null,
+                filled($primary['description'] ?? null) ? 'Top finding: ' . Str::limit((string) $primary['description'], 240) : null,
+            ]))),
+            'recommendation' => (string) ($primary['recommendation'] ?? 'Review the parsed result for this tool in S3 and remediate the reported issues.'),
+            'suggestion' => (string) ($primary['suggestion'] ?? 'Use this tool-level summary to decide whether deeper inspection is needed.'),
+            'object' => (string) ($primary['object'] ?? $file['cluster_name'] ?? 'Scan result'),
+            'metadata' => array_merge($primary['metadata'] ?? [], [
+                'object' => $primary['object'] ?? $file['cluster_name'] ?? 'Scan result',
+                's3_path' => $file['path'] ?? null,
+                's3_prefix' => $file['prefix'] ?? null,
+                'result_status' => 'parsed',
+                'finding_counts' => $counts,
+                'remote_task_id' => $file['remote_task_id'] ?? null,
+                'local_task_id' => $file['local_task_id'] ?? null,
+            ]),
+        ];
+    }
+
+    protected function makeMissingResultRecord(array $file): array
+    {
+        return [
+            'tool' => (string) ($file['tool'] ?? 'unknown'),
+            'scan_id' => (string) (($file['remote_task_id'] ?? '') ?: ($file['scan_id'] ?? 'unknown-task')),
+            'scan_status' => Str::upper((string) ($file['remote_status'] ?? 'COMPLETED')),
+            'cluster_name' => (string) ($file['cluster_name'] ?? 'Unknown cluster'),
+            'scanned_at' => Carbon::createFromTimestamp((int) ($file['last_modified'] ?? time())),
+            'status_bucket' => 'WARN',
+            'description' => 'Result file not found in S3 for this tool.',
+            'recommendation' => 'Verify the expected S3 object name and prefix for this task result.',
+            'suggestion' => 'Confirm whether the worker wrote `result-' . ($file['tool'] ?? 'tool') . '.json` or another supported file name under the task prefix.',
+            'object' => (string) ($file['cluster_name'] ?? 'Scan result'),
+            'metadata' => [
+                'object' => $file['cluster_name'] ?? 'Scan result',
+                's3_path' => $file['path'] ?? null,
+                's3_prefix' => $file['prefix'] ?? null,
+                'result_status' => 'result_file_not_found',
+                'fallback_paths' => $file['fallback_paths'] ?? [],
+                'remote_task_id' => $file['remote_task_id'] ?? null,
+                'local_task_id' => $file['local_task_id'] ?? null,
+            ],
+        ];
+    }
+
+    protected function makeParseErrorRecord(array $file, \Throwable $exception): array
+    {
+        return [
+            'tool' => (string) ($file['tool'] ?? 'unknown'),
+            'scan_id' => (string) (($file['remote_task_id'] ?? '') ?: ($file['scan_id'] ?? 'unknown-task')),
+            'scan_status' => Str::upper((string) ($file['remote_status'] ?? 'COMPLETED')),
+            'cluster_name' => (string) ($file['cluster_name'] ?? 'Unknown cluster'),
+            'scanned_at' => Carbon::createFromTimestamp((int) ($file['last_modified'] ?? time())),
+            'status_bucket' => 'WARN',
+            'description' => 'Result file was found in S3 but could not be parsed.',
+            'recommendation' => 'Review the raw JSON result object and update the parser to match the file format.',
+            'suggestion' => 'Latest parser error: ' . Str::limit($exception->getMessage(), 180),
+            'object' => (string) ($file['cluster_name'] ?? 'Scan result'),
+            'metadata' => [
+                'object' => $file['cluster_name'] ?? 'Scan result',
+                's3_path' => $file['path'] ?? null,
+                's3_prefix' => $file['prefix'] ?? null,
+                'result_status' => 'parse_error',
+                'parse_error' => $exception->getMessage(),
+                'remote_task_id' => $file['remote_task_id'] ?? null,
+                'local_task_id' => $file['local_task_id'] ?? null,
+            ],
+        ];
+    }
+
+    protected function severityRank(string $bucket): int
+    {
+        return match (Str::upper($bucket)) {
+            'FAIL' => 3,
+            'WARN' => 2,
+            'PASS' => 1,
+            default => 0,
+        };
     }
 
     protected function discoverS3ResultPathInPrefix(string $disk, string $prefix, string $tool, array $excludedPaths = []): ?string
@@ -471,6 +909,18 @@ class ScanService
             'curl error',
             'unable to list contents',
             'aws http error',
+        ]);
+    }
+
+    protected function isS3MissingFileException(\Throwable $exception): bool
+    {
+        $message = Str::lower($exception->getMessage());
+
+        return Str::contains($message, [
+            'unable to read file from location',
+            'nosuchkey',
+            'specified key does not exist',
+            '404 not found',
         ]);
     }
 

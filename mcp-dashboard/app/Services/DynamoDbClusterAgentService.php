@@ -6,8 +6,10 @@ use App\Models\ClusterAgent;
 use App\Support\AwsCredentialFactory;
 use Aws\DynamoDb\DynamoDbClient;
 use Aws\DynamoDb\Marshaler;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Str;
+use Throwable;
 
 class DynamoDbClusterAgentService
 {
@@ -54,47 +56,69 @@ class DynamoDbClusterAgentService
     {
         $ttl = max(1, (int) env('CLUSTER_AGENT_CACHE_TTL_SECONDS', 60));
         $cacheKey = $this->cacheKey();
+        $cachedAgents = Cache::get($cacheKey);
 
-        if ($forceRefresh) {
-            Cache::forget($cacheKey);
+        if (! $forceRefresh && is_array($cachedAgents)) {
+            return $cachedAgents;
         }
 
-        return Cache::remember($cacheKey, now()->addSeconds($ttl), function (): array {
-            $client = $this->makeClient();
-            $marshaler = new Marshaler();
-            $table = $this->tableName();
-            $items = [];
-            $lastEvaluatedKey = null;
+        try {
+            $agents = $this->fetchAgentsFromDynamoDb();
 
-            do {
-                $params = [
-                    'TableName' => $table,
-                ];
+            Cache::put($cacheKey, $agents, now()->addSeconds($ttl));
 
-                if ($lastEvaluatedKey !== null) {
-                    $params['ExclusiveStartKey'] = $lastEvaluatedKey;
+            return $agents;
+        } catch (Throwable $exception) {
+            Log::warning('Failed to sync cluster agents from DynamoDB.', [
+                'table' => $this->tableName(),
+                'message' => $exception->getMessage(),
+                'has_cached_agents' => is_array($cachedAgents) && $cachedAgents !== [],
+            ]);
+
+            if (is_array($cachedAgents)) {
+                return $cachedAgents;
+            }
+
+            return [];
+        }
+    }
+
+    protected function fetchAgentsFromDynamoDb(): array
+    {
+        $client = $this->makeClient();
+        $marshaler = new Marshaler();
+        $table = $this->tableName();
+        $items = [];
+        $lastEvaluatedKey = null;
+
+        do {
+            $params = [
+                'TableName' => $table,
+            ];
+
+            if ($lastEvaluatedKey !== null) {
+                $params['ExclusiveStartKey'] = $lastEvaluatedKey;
+            }
+
+            $result = $client->scan($params);
+
+            foreach (($result['Items'] ?? []) as $item) {
+                $record = $marshaler->unmarshalItem($item);
+                $normalized = $this->normalizeAgentRecord($record);
+
+                if ($normalized !== null) {
+                    $items[] = $normalized;
                 }
+            }
 
-                $result = $client->scan($params);
+            $lastEvaluatedKey = $result['LastEvaluatedKey'] ?? null;
+        } while ($lastEvaluatedKey !== null);
 
-                foreach (($result['Items'] ?? []) as $item) {
-                    $record = $marshaler->unmarshalItem($item);
-                    $normalized = $this->normalizeAgentRecord($record);
-
-                    if ($normalized !== null) {
-                        $items[] = $normalized;
-                    }
-                }
-
-                $lastEvaluatedKey = $result['LastEvaluatedKey'] ?? null;
-            } while ($lastEvaluatedKey !== null);
-
-            return collect($items)
-                ->unique(fn (array $agent): string => Str::lower($agent['cluster_name'] . '|' . $agent['label']))
-                ->sortBy(['cluster_name', 'label'])
-                ->values()
-                ->all();
-        });
+        return collect($items)
+            ->unique(fn (array $agent): string => Str::lower($agent['cluster_name'] . '|' . $agent['label']))
+            ->sortBy(['cluster_name', 'label'])
+            ->values()
+            ->all();
     }
 
     protected function cacheKey(): string

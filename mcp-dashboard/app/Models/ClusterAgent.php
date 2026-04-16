@@ -39,4 +39,9 @@ class ClusterAgent extends Model
     {
         return $query->where('is_active', true);
     }
+
+    public function scopeRemoteBacked(Builder $query): Builder
+    {
+        return $query->whereNotNull('label');
+    }
 }
